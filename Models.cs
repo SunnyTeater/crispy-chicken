@@ -129,6 +129,18 @@ public sealed class Job
     /// <summary>Gets or sets die Geschwindigkeit relativ zur Echtzeit.</summary>
     public double EncodeSpeed { get; set; }
 
+    /// <summary>Gets or sets die reine Rechenzeit in Sekunden (ohne Pausen wegen aktiver Streams).</summary>
+    public double ActiveSeconds { get; set; }
+
+    /// <summary>Gets or sets die mittlere Geschwindigkeit des fertigen Jobs relativ zur Echtzeit. Grundlage fuer die Zeitschaetzung weiterer Jobs.</summary>
+    public double AverageSpeed { get; set; }
+
+    public int Width { get; set; }
+
+    public int Height { get; set; }
+
+    public double Fps { get; set; }
+
     public string? Message { get; set; }
 
     public DateTime Created { get; set; }

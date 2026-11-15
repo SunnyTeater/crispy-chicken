@@ -57,6 +57,12 @@ public sealed class JobRunner : IHostedService, IDisposable
     private readonly IUserDataManager _userDataManager;
     private readonly IMediaEncoder _mediaEncoder;
     private readonly ILogger<JobRunner> _logger;
+    private readonly LiveLog _log;
+    private readonly Stopwatch _activeWatch = new();
+    private readonly Dictionary<string, string> _progressBlock = new(StringComparer.Ordinal);
+    private DateTime _lastProgressLog = DateTime.MinValue;
+    private bool? _lastBlocked;
+    private double? _currentExpectedSpeed;
     private readonly CancellationTokenSource _stopping = new();
     private readonly object _lock = new();
     private readonly object _planLock = new();
@@ -83,6 +89,7 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// <param name="userDataManager">Die Benutzerdaten (Gesehen-Status, Fortschritt).</param>
     /// <param name="mediaEncoder">Jellyfins ffmpeg-Zugang.</param>
     /// <param name="logger">Der Logger.</param>
+    /// <param name="log">Das Live-Protokoll.</param>
     public JobRunner(
         JobStore store,
         LibraryIndex index,
@@ -92,8 +99,10 @@ public sealed class JobRunner : IHostedService, IDisposable
         IUserManager userManager,
         IUserDataManager userDataManager,
         IMediaEncoder mediaEncoder,
-        ILogger<JobRunner> logger)
+        ILogger<JobRunner> logger,
+        LiveLog log)
     {
+        _log = log;
         _store = store;
         _index = index;
         _libraryManager = libraryManager;
@@ -131,6 +140,92 @@ public sealed class JobRunner : IHostedService, IDisposable
     public static bool CanPause => !OperatingSystem.IsWindows();
 
     private static PluginConfiguration Config => Plugin.Instance?.Configuration ?? new PluginConfiguration();
+
+    /// <summary>
+    /// Schaetzt die restliche Rechenzeit eines Jobs in Sekunden. Grundlage sind die Zeitangaben von ffmpeg:
+    /// beim laufenden Job der bisher umgewandelte Anteil und die dafuer gebrauchte Rechenzeit, bei wartenden Jobs
+    /// die Geschwindigkeit frueherer Jobs mit demselben Encoder, umgerechnet auf Aufloesung und Bildrate.
+    /// </summary>
+    /// <param name="job">Der Job (Kopie oder Original).</param>
+    /// <param name="all">Alle Jobs.</param>
+    /// <returns>Sekunden oder null, wenn noch keine Grundlage da ist.</returns>
+    public static double? EstimateSeconds(Job job, IReadOnlyList<Job> all)
+    {
+        if (job.DurationSeconds <= 0)
+        {
+            return null;
+        }
+
+        var expected = ExpectedSpeed(job.Encoder, job.Speed, job.Width, job.Height, job.Fps, all.Where(j => !string.Equals(j.Id, job.Id, StringComparison.Ordinal)).ToList());
+        if (job.State is JobState.Running or JobState.Paused)
+        {
+            // Der Encoder liefert die ersten Bilder mit Verzoegerung: ganz am Anfang wirkt der Job langsamer, als er ist.
+            // Solange weniger als 5 % umgewandelt sind, zaehlt deshalb der Erfahrungswert frueherer Jobs, falls es einen gibt.
+            if (job.Progress < 0.05 && expected is not null)
+            {
+                return job.DurationSeconds * (1 - job.Progress) / expected.Value;
+            }
+
+            if (job.ActiveSeconds < 10 || job.Progress < 0.005)
+            {
+                return expected is null ? null : job.DurationSeconds * (1 - job.Progress) / expected.Value;
+            }
+
+            var speed = job.Progress * job.DurationSeconds / job.ActiveSeconds;
+            return speed <= 0 ? null : job.DurationSeconds * (1 - job.Progress) / speed;
+        }
+
+        return expected is null ? null : job.DurationSeconds / expected.Value;
+    }
+
+    /// <summary>
+    /// Erwartete Geschwindigkeit (Vielfaches der Echtzeit) fuer einen Encoder bei gegebener Aufloesung.
+    /// </summary>
+    /// <param name="encoder">Der Encoder.</param>
+    /// <param name="speedSetting">Die Geschwindigkeitsstufe.</param>
+    /// <param name="width">Breite.</param>
+    /// <param name="height">Hoehe.</param>
+    /// <param name="fps">Bildrate.</param>
+    /// <param name="all">Alle Jobs.</param>
+    /// <returns>Geschwindigkeit oder null ohne Erfahrungswerte.</returns>
+    public static double? ExpectedSpeed(string encoder, string speedSetting, int width, int height, double fps, IReadOnlyList<Job> all)
+    {
+        static double Load(int w, int h, double f) => Math.Max(1, w) * (double)Math.Max(1, h) * (f is > 1 and < 300 ? f : 24);
+
+        // Bildpunkte pro Sekunde Rechenzeit, die der Encoder zuletzt geschafft hat.
+        var samples = new List<double>();
+        foreach (var other in all.Where(j => string.Equals(j.Encoder, encoder, StringComparison.Ordinal)
+                     && string.Equals(j.Speed, speedSetting, StringComparison.Ordinal)
+                     && j.Width > 0 && j.Height > 0).OrderByDescending(j => j.Started ?? j.Created))
+        {
+            double speed = 0;
+            if (other.AverageSpeed > 0)
+            {
+                speed = other.AverageSpeed;
+            }
+            else if (other.State is JobState.Running or JobState.Paused && other.ActiveSeconds >= 30 && other.Progress >= 0.02)
+            {
+                speed = other.Progress * other.DurationSeconds / other.ActiveSeconds;
+            }
+
+            if (speed > 0)
+            {
+                samples.Add(speed * Load(other.Width, other.Height, other.Fps));
+                if (samples.Count == 5)
+                {
+                    break;
+                }
+            }
+        }
+
+        if (samples.Count == 0 || width <= 0 || height <= 0)
+        {
+            return null;
+        }
+
+        samples.Sort();
+        return samples[samples.Count / 2] / Load(width, height, fps);
+    }
 
     /// <summary>
     /// Ob die Datei eines Jobs gerade in einer Sitzung abgespielt wird.
@@ -275,6 +370,9 @@ public sealed class JobRunner : IHostedService, IDisposable
                 SourceSize = entry.Size,
                 EstimatedSize = EncoderCatalog.EstimateSize(entry, target, encoder, request.Quality),
                 DurationSeconds = entry.DurationSeconds,
+                Width = entry.Width,
+                Height = entry.Height,
+                Fps = entry.Fps,
                 State = JobState.Queued,
                 Created = DateTime.UtcNow.AddTicks(jobs.Count)
             });
@@ -410,6 +508,15 @@ public sealed class JobRunner : IHostedService, IDisposable
                 RestoreUserStates();
 
                 var job = _store.NextQueued();
+                var blockedNow = IsBlocked;
+                if (job is not null && _lastBlocked != blockedNow)
+                {
+                    _lastBlocked = blockedNow;
+                    _log.Add(blockedNow
+                        ? "Warteschlange wartet: " + ActiveStreams + " Streams aktiv (Grenze " + StreamLimit + ")."
+                        : "Warteschlange läuft: " + ActiveStreams + " Streams aktiv (Grenze " + StreamLimit + ").");
+                }
+
                 if (job is not null && string.IsNullOrEmpty(_mediaEncoder.EncoderPath))
                 {
                     // Kurz nach dem Serverstart hat Jellyfin sein ffmpeg noch nicht geprueft: warten statt scheitern.
@@ -445,9 +552,16 @@ public sealed class JobRunner : IHostedService, IDisposable
         }
     }
 
+    private static string Clock(double seconds)
+    {
+        var time = TimeSpan.FromSeconds(Math.Max(0, seconds));
+        return string.Format(CultureInfo.InvariantCulture, "{0:00}:{1:00}:{2:00}", (int)time.TotalHours, time.Minutes, time.Seconds);
+    }
+
     private void Fail(Job job, string message)
     {
         _logger.LogWarning("Codec Converter: {Name} fehlgeschlagen: {Message}", job.Name, message);
+        _log.Add("FEHLER " + job.Name + ": " + message);
         _store.Update(job, j =>
         {
             j.State = JobState.Failed;
@@ -558,6 +672,9 @@ public sealed class JobRunner : IHostedService, IDisposable
             });
 
             _logger.LogInformation("Codec Converter: starte {Name} ({Source} -> {Target}, {Encoder}, Qualität {Quality})", job.Name, job.SourceCodec, job.TargetCodec, job.Encoder, job.Quality);
+            _log.Add("START " + job.Name + ": " + job.SourceCodec + " → " + job.TargetCodec + " mit " + job.Encoder + ", Qualitätswert " + job.Quality + ", Geschwindigkeit " + job.Speed + ", Laufzeit " + Clock(job.DurationSeconds));
+            _log.Add("Quelle: " + Path.GetFileName(job.SourcePath) + "  →  Ziel: " + Path.GetFileName(job.TargetPath));
+            _log.Add("ffmpeg " + string.Join(' ', arguments.Select(a => a.Contains(' ', StringComparison.Ordinal) ? "\"" + a + "\"" : a)));
 
             var (exitCode, errorText, cancelled) = await RunFfmpegAsync(job, arguments, token).ConfigureAwait(false);
 
@@ -566,6 +683,7 @@ public sealed class JobRunner : IHostedService, IDisposable
                 // Nicht jede Grafikkarte kann jede Quelle dekodieren (alte Codecs, 10 Bit ...): zweiter Versuch,
                 // bei dem die CPU dekodiert und nur das Kodieren auf der GPU laeuft.
                 _logger.LogInformation("Codec Converter: {Name}: Dekodieren auf der GPU fehlgeschlagen ({Error}), zweiter Versuch mit CPU-Dekodierung", job.Name, errorText);
+                _log.Add("Dekodieren auf der Grafikkarte fehlgeschlagen, zweiter Versuch mit CPU-Dekodierung.");
                 DeleteIfExists(job.TempPath);
                 _store.Update(job, j => j.Progress = 0);
                 arguments = EncoderCatalog.BuildArguments(job, format, Math.Clamp(Config.Threads, 0, 256), Config.VaapiDevice ?? string.Empty, false);
@@ -593,7 +711,15 @@ public sealed class JobRunner : IHostedService, IDisposable
                     j.Message = "Abgebrochen";
                     j.Finished = DateTime.UtcNow;
                 });
+                _log.Add("ABGEBROCHEN " + job.Name + ", halbfertige Datei gelöscht.");
                 return;
+            }
+
+            if (exitCode == 0 && job.ActiveSeconds > 0)
+            {
+                // Erfahrungswert fuer die Zeitschaetzung der naechsten Jobs.
+                _store.Update(job, j => j.AverageSpeed = j.DurationSeconds / j.ActiveSeconds);
+                _log.Add("ffmpeg fertig nach " + Clock(job.ActiveSeconds) + " Rechenzeit (" + job.AverageSpeed.ToString("0.00", CultureInfo.InvariantCulture) + "× Echtzeit). Prüfe die neue Datei …");
             }
 
             if (exitCode != 0)
@@ -659,6 +785,11 @@ public sealed class JobRunner : IHostedService, IDisposable
                 return;
             }
 
+            if (e.Data.Length > 0)
+            {
+                _log.Add("ffmpeg: " + e.Data);
+            }
+
             lock (errors)
             {
                 // Nur das Ende der Ausgabe aufheben.
@@ -693,12 +824,18 @@ public sealed class JobRunner : IHostedService, IDisposable
         var paused = false;
         var cancelled = false;
         _lastOutput = DateTime.UtcNow;
+        _lastProgressLog = DateTime.MinValue;
+        _progressBlock.Clear();
+        _currentExpectedSpeed = ExpectedSpeed(job.Encoder, job.Speed, job.Width, job.Height, job.Fps, _store.Snapshot().Where(j => !string.Equals(j.Id, job.Id, StringComparison.Ordinal)).ToList());
+        _activeWatch.Restart();
+        _store.Update(job, j => j.ActiveSeconds = 0, persist: false);
         while (!process.HasExited)
         {
             if (!paused && DateTime.UtcNow - _lastOutput > StallTimeout)
             {
                 // Ein haengendes ffmpeg wuerde sonst die ganze Warteschlange blockieren.
                 _logger.LogWarning("Codec Converter: ffmpeg meldet seit {Minutes} Minuten nichts mehr und wird beendet", StallTimeout.TotalMinutes);
+                _log.Add("ffmpeg meldet seit " + StallTimeout.TotalMinutes.ToString(CultureInfo.InvariantCulture) + " Minuten nichts mehr und wird beendet.");
                 KillProcess();
                 stalled = true;
                 break;
@@ -721,12 +858,16 @@ public sealed class JobRunner : IHostedService, IDisposable
             if (blocked && !paused && Signal(process, stop: true))
             {
                 paused = true;
+                _activeWatch.Stop();
+                _log.Add("PAUSE " + job.Name + ": " + ActiveStreams + " Streams aktiv (Grenze " + StreamLimit + ").");
                 _store.Update(job, j => j.State = JobState.Paused);
                 _logger.LogInformation("Codec Converter: {Name} angehalten, {Streams} Streams aktiv", job.Name, ActiveStreams);
             }
             else if (!blocked && paused && Signal(process, stop: false))
             {
                 paused = false;
+                _activeWatch.Start();
+                _log.Add("WEITER " + job.Name + ": Streams wieder unter der Grenze.");
                 _lastOutput = DateTime.UtcNow;
                 _store.Update(job, j => j.State = JobState.Running);
                 _logger.LogInformation("Codec Converter: {Name} läuft weiter", job.Name);
@@ -745,6 +886,8 @@ public sealed class JobRunner : IHostedService, IDisposable
         }
 
         await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
+        _activeWatch.Stop();
+        _store.Update(job, j => j.ActiveSeconds = _activeWatch.Elapsed.TotalSeconds, persist: false);
 
         string errorText;
         lock (errors)
@@ -773,17 +916,66 @@ public sealed class JobRunner : IHostedService, IDisposable
             return;
         }
 
-        if (line.StartsWith("out_time_us=", StringComparison.Ordinal)
-            && long.TryParse(line.AsSpan(12), NumberStyles.Integer, CultureInfo.InvariantCulture, out var microseconds)
+        var separator = line.IndexOf('=', StringComparison.Ordinal);
+        if (separator <= 0)
+        {
+            return;
+        }
+
+        var key = line[..separator];
+        var value = line[(separator + 1)..].Trim();
+        _progressBlock[key] = value;
+
+        if (key == "out_time_us"
+            && long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var microseconds)
             && microseconds > 0)
         {
             var progress = Math.Clamp(microseconds / 1_000_000d / job.DurationSeconds, 0, 0.999);
-            _store.Update(job, j => j.Progress = progress, persist: false);
+            var active = _activeWatch.Elapsed.TotalSeconds;
+            _store.Update(
+                job,
+                j =>
+                {
+                    j.Progress = progress;
+                    j.ActiveSeconds = active;
+                },
+                persist: false);
         }
-        else if (line.StartsWith("speed=", StringComparison.Ordinal)
-            && double.TryParse(line.AsSpan(6).TrimEnd('x').Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var speed))
+        else if (key == "speed"
+            && double.TryParse(value.TrimEnd('x'), NumberStyles.Float, CultureInfo.InvariantCulture, out var speed))
         {
             _store.Update(job, j => j.EncodeSpeed = speed, persist: false);
+        }
+        else if (key == "progress" && DateTime.UtcNow - _lastProgressLog > TimeSpan.FromSeconds(5))
+        {
+            // "progress" schliesst einen Block von ffmpeg ab: alle paar Sekunden eine Zeile fuers Live-Protokoll.
+            _lastProgressLog = DateTime.UtcNow;
+            _progressBlock.TryGetValue("frame", out var frame);
+            _progressBlock.TryGetValue("fps", out var fps);
+            _progressBlock.TryGetValue("total_size", out var size);
+            var megabytes = long.TryParse(size, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bytes) ? (bytes / 1048576d).ToString("0.0", CultureInfo.InvariantCulture) + " MB" : "?";
+            // Dieselbe Rechnung wie in der Warteschlange: am Anfang der Erfahrungswert frueherer Jobs, danach der eigene Verlauf.
+            double? remaining = null;
+            var ownHistory = job.ActiveSeconds >= 10 && job.Progress >= 0.005;
+            if (_currentExpectedSpeed is not null && (job.Progress < 0.05 || !ownHistory))
+            {
+                remaining = job.DurationSeconds * (1 - job.Progress) / _currentExpectedSpeed.Value;
+            }
+            else if (ownHistory)
+            {
+                remaining = job.DurationSeconds * (1 - job.Progress) / (job.Progress * job.DurationSeconds / job.ActiveSeconds);
+            }
+
+            _log.Add(string.Format(
+                CultureInfo.InvariantCulture,
+                "{0:0} %  Bild {1}  {2} Bilder/s  Stelle {3} von {4}  bisher {5}  Rest ca. {6}",
+                job.Progress * 100,
+                frame ?? "?",
+                fps ?? "?",
+                Clock(job.Progress * job.DurationSeconds),
+                Clock(job.DurationSeconds),
+                megabytes,
+                remaining is null ? "?" : Clock(remaining.Value)));
         }
     }
 
@@ -961,6 +1153,14 @@ public sealed class JobRunner : IHostedService, IDisposable
             j.Message = "Neue Datei: " + Path.GetFileName(j.TargetPath) + ". Das Original bleibt bis zur Freigabe erhalten.";
         });
         _logger.LogInformation("Codec Converter: {Name} umgewandelt, {Before} -> {After} Bytes, wartet auf Freigabe", job.Name, job.SourceSize, size);
+        _log.Add(string.Format(
+            CultureInfo.InvariantCulture,
+            "FERTIG {0}: Prüfung bestanden, neue Datei {1} abgelegt ({2:0.0} MB statt {3:0.0} MB){4}. Wartet auf Freigabe.",
+            job.Name,
+            Path.GetFileName(job.TargetPath),
+            size / 1048576d,
+            job.SourceSize / 1048576d,
+            sidecars.Count > 0 ? ", " + sidecars.Count + " Untertiteldatei(en) mitkopiert" : string.Empty));
 
         RefreshLibrary(job);
     }
@@ -1083,6 +1283,7 @@ public sealed class JobRunner : IHostedService, IDisposable
                 j.Message = (automatic ? "Automatisch freigegeben" : "Freigegeben") + ", Original gelöscht. Neue Datei: " + Path.GetFileName(j.TargetPath);
             });
             _logger.LogInformation("Codec Converter: {Name} {Mode} freigegeben, Original {Path} gelöscht", job.Name, automatic ? "automatisch" : "von Hand", job.SourcePath);
+            _log.Add("FREIGEGEBEN " + job.Name + (automatic ? " (automatisch nach Fristablauf)" : string.Empty) + ": Original " + Path.GetFileName(job.SourcePath) + " gelöscht.");
             RefreshLibrary(job);
             return null;
         }
@@ -1193,6 +1394,7 @@ public sealed class JobRunner : IHostedService, IDisposable
 
                 _store.Update(job, j => j.PendingUserStates = new List<UserState>());
                 _logger.LogInformation("Codec Converter: Gesehen-Status von {Name} auf die neue Datei übertragen", job.Name);
+                _log.Add("Gesehen-Status von " + job.Name + " auf die neue Datei übertragen.");
             }
             catch (Exception ex)
             {
@@ -1259,6 +1461,7 @@ public sealed class JobRunner : IHostedService, IDisposable
                 j.Message = "Verworfen, das Original bleibt.";
             });
             _logger.LogInformation("Codec Converter: {Name} verworfen, {Path} gelöscht", job.Name, job.TargetPath);
+            _log.Add("VERWORFEN " + job.Name + ": neue Datei " + Path.GetFileName(job.TargetPath) + " gelöscht, Original bleibt.");
             RefreshLibrary(job);
             return null;
         }

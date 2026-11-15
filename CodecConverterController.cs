@@ -24,6 +24,7 @@ public class CodecConverterController : ControllerBase
     private readonly LibraryIndex _index;
     private readonly JobStore _store;
     private readonly JobRunner _runner;
+    private readonly LiveLog _log;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="CodecConverterController"/> class.
@@ -31,8 +32,10 @@ public class CodecConverterController : ControllerBase
     /// <param name="index">Der Bibliotheksindex.</param>
     /// <param name="store">Die Warteschlange.</param>
     /// <param name="runner">Der Job-Dienst.</param>
-    public CodecConverterController(LibraryIndex index, JobStore store, JobRunner runner)
+    /// <param name="log">Das Live-Protokoll.</param>
+    public CodecConverterController(LibraryIndex index, JobStore store, JobRunner runner, LiveLog log)
     {
+        _log = log;
         _index = index;
         _store = store;
         _runner = runner;
@@ -108,17 +111,31 @@ public class CodecConverterController : ControllerBase
         }
 
         var wanted = request.ItemIds.ToHashSet();
+        var history = _store.Snapshot();
         long source = 0;
         long estimated = 0;
         var count = 0;
+        double seconds = 0;
+        var timeKnown = true;
         foreach (var entry in _index.GetEntries(false).Where(e => wanted.Contains(e.Id) && e.Blocked is null))
         {
             source += entry.Size;
             estimated += EncoderCatalog.EstimateSize(entry, target!, encoder!, request.Quality);
             count++;
+
+            // Rechenzeit aus der Geschwindigkeit frueherer Jobs mit demselben Encoder.
+            var speed = JobRunner.ExpectedSpeed(encoder!.Name, request.Speed, entry.Width, entry.Height, entry.Fps, history);
+            if (speed is null || entry.DurationSeconds <= 0)
+            {
+                timeKnown = false;
+            }
+            else
+            {
+                seconds += entry.DurationSeconds / speed.Value;
+            }
         }
 
-        return Ok(new { Count = count, SourceBytes = source, EstimatedBytes = estimated });
+        return Ok(new { Count = count, SourceBytes = source, EstimatedBytes = estimated, EstimatedSeconds = timeKnown && count > 0 ? seconds : (double?)null });
     }
 
     /// <summary>
@@ -150,12 +167,19 @@ public class CodecConverterController : ControllerBase
     [HttpGet("Jobs")]
     public ActionResult GetJobs()
     {
+        var all = _store.Snapshot();
+        var etas = all.ToDictionary(j => j.Id, j => j.State is JobState.Queued or JobState.Running or JobState.Paused ? JobRunner.EstimateSeconds(j, all) : null);
+        var pending = etas.Where(e => all.First(j => j.Id == e.Key).State is JobState.Queued or JobState.Running or JobState.Paused).ToList();
+
         return Ok(new
         {
             _runner.ActiveStreams,
             _runner.StreamLimit,
             _runner.IsBlocked,
-            Jobs = _store.Snapshot().Select(j => new
+
+            // Restliche Rechenzeit der ganzen Warteschlange; null, solange fuer einen Job noch kein Erfahrungswert da ist.
+            QueueEtaSeconds = pending.Count > 0 && pending.All(e => e.Value.HasValue) ? pending.Sum(e => e.Value!.Value) : (double?)null,
+            Jobs = all.Select(j => new
             {
                 j.Id,
                 j.Name,
@@ -166,6 +190,8 @@ public class CodecConverterController : ControllerBase
                 State = j.State.ToString(),
                 j.Progress,
                 j.EncodeSpeed,
+                EtaSeconds = etas[j.Id],
+                j.ActiveSeconds,
                 j.SourceSize,
                 j.EstimatedSize,
                 j.ResultSize,
@@ -181,6 +207,17 @@ public class CodecConverterController : ControllerBase
                     : (DateTime?)null
             })
         });
+    }
+
+    /// <summary>
+    /// Liefert die Zeilen des Live-Protokolls nach einer Nummer.
+    /// </summary>
+    /// <param name="after">Die zuletzt gesehene Nummer (0 = alles Vorhandene).</param>
+    /// <returns>Die neuen Zeilen.</returns>
+    [HttpGet("Log")]
+    public ActionResult GetLog([FromQuery] long after = 0)
+    {
+        return Ok(new { Lines = _log.Since(after) });
     }
 
     /// <summary>

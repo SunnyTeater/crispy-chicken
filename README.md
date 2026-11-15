@@ -7,7 +7,12 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 - **Auswahl:** nach aktuellem Codec filtern, dann Filme, ganze Serien, einzelne Staffeln oder einzelne Folgen ankreuzen.
 - **Ziel und Verlust:** Zielcodec, Encoder (CPU oder NVENC / Quick Sync / VAAPI) und Verlust-Stufe bzw. Qualitätswert (CRF) wählen.
-- **Schätzung:** zeigt vor dem Start grob, wie groß die Auswahl danach etwa ist.
+- **Schätzung:** zeigt vor dem Start grob, wie groß die Auswahl danach etwa ist und wie lange die Umwandlung rechnet.
+- **Restzeit:** Beim laufenden Job aus den Fortschrittsdaten von ffmpeg (umgewandelte Laufzeit und dafür gebrauchte
+  Rechenzeit), bei wartenden Jobs hochgerechnet aus früheren Jobs mit demselben Encoder. Pausen wegen aktiver Streams
+  zählen nicht mit.
+- **Live-Protokoll:** zeigt auf der Plugin-Seite den ffmpeg-Aufruf, alle paar Sekunden den Fortschritt, Pausen,
+  Prüfung und Freigabe.
 - **Warteschlange:** immer ein Job gleichzeitig, und nur solange weniger Streams aktiv sind als die Stream-Grenze
   (Standard 2, also höchstens ein laufender Stream). Wird die Grenze erreicht, hält der laufende Job an und
   macht später an derselben Stelle weiter.
@@ -30,11 +35,11 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 Danach „Codec Converter“ im Katalog installieren und Jellyfin neu starten.
 
-**Von Hand:** `codec-converter_1.1.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
+**Von Hand:** `codec-converter_1.2.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
 
-    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.1.0.0
-    sudo unzip codec-converter_1.1.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.1.0.0
-    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.1.0.0
+    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.2.0.0
+    sudo unzip codec-converter_1.2.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.2.0.0
+    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.2.0.0
     sudo systemctl restart jellyfin
 
 Danach: Dashboard → Codec Converter. Auf dem Server wird nichts zusätzlich installiert, das Plugin benutzt

@@ -33,6 +33,7 @@
                     #CodecConverterPage .ccBar { height: .5em; min-width: 6em; border-radius: .3em; background: rgba(128, 128, 128, .3); overflow: hidden; }
                     #CodecConverterPage .ccBar > div { height: 100%; background: #00a4dc; }
                     #CodecConverterPage .ccSmall { font-size: .85em; opacity: .75; word-break: break-word; }
+                    #CodecConverterPage .ccLog { max-height: 22em; overflow: auto; margin: 0; padding: .8em; border-radius: .3em; background: rgba(0, 0, 0, .35); font-family: monospace; font-size: .85em; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
                     #CodecConverterPage .ccWarning { margin: 0 0 1.5em; padding: .8em 1em; border-radius: .4em; background: rgba(204, 51, 51, .2); border: 1px solid #c33; }
                 </style>
 
@@ -130,6 +131,12 @@
                         <button is="emby-button" type="button" id="ccApproveAll" class="raised button-submit emby-button"><span>Alle freigeben</span></button>
                         <button is="emby-button" type="button" id="ccClear" class="raised emby-button"><span>Abgeschlossene entfernen</span></button>
                     </div>
+                </div>
+
+                <div class="ccBox">
+                    <h3>Live-Protokoll</h3>
+                    <div class="fieldDescription" style="margin-bottom: .8em;">Zeigt, was das Plugin gerade tut: den ffmpeg-Aufruf, alle paar Sekunden den Fortschritt, Pausen wegen aktiver Streams, Prüfung und Freigabe. Das Protokoll beginnt mit jedem Serverstart neu; dauerhaft steht alles im Jellyfin-Log.</div>
+                    <pre id="ccLog" class="ccLog">Noch keine Einträge.</pre>
                 </div>
 
                 <div class="ccBox">
@@ -239,6 +246,22 @@
                         i++;
                     }
                     return bytes.toLocaleString('de-DE', { maximumFractionDigits: i < 2 ? 0 : 1 }) + ' ' + units[i];
+                }
+
+                // Dauer in Worten: "ca. 1 h 05 min", "ca. 12 min", "unter 1 min".
+                function duration(seconds) {
+                    if (seconds === null || seconds === undefined || isNaN(seconds)) {
+                        return null;
+                    }
+                    var minutes = Math.round(seconds / 60);
+                    if (minutes < 1) {
+                        return 'unter 1 min';
+                    }
+                    if (minutes < 60) {
+                        return 'ca. ' + minutes + ' min';
+                    }
+                    var hours = Math.floor(minutes / 60);
+                    return 'ca. ' + hours + ' h ' + ('0' + (minutes % 60)).slice(-2) + ' min';
                 }
 
                 function codecLabel(codec) {
@@ -524,9 +547,13 @@
                         }
                         var saved = result.SourceBytes - result.EstimatedBytes;
                         var percent = result.SourceBytes > 0 ? Math.round(saved / result.SourceBytes * 100) : 0;
+                        var time = duration(result.EstimatedSeconds);
                         box.textContent = result.Count + (result.Count === 1 ? ' Datei' : ' Dateien') + ': ' + size(result.SourceBytes)
                             + ' → ca. ' + size(result.EstimatedBytes) + ' (spart ca. ' + size(saved) + ', ' + percent + ' %). '
-                            + 'Grobe Schätzung aus Auflösung, Laufzeit und Qualitätswert, das Ergebnis kann je nach Bildinhalt deutlich abweichen.';
+                            + 'Grobe Schätzung aus Auflösung, Laufzeit und Qualitätswert, das Ergebnis kann je nach Bildinhalt deutlich abweichen. '
+                            + (time
+                                ? 'Erwartete Rechenzeit: ' + time + ', hochgerechnet aus früheren Jobs mit diesem Encoder.'
+                                : 'Erwartete Rechenzeit: noch unbekannt, sie steht fest, sobald ein Job mit diesem Encoder und dieser Geschwindigkeit gelaufen ist.');
                     }).catch(function (error) {
                         if (run === estimateRun) {
                             box.textContent = error.message;
@@ -543,7 +570,8 @@
                     status.className = 'ccStatus' + (result.IsBlocked ? ' ccBlocked' : '');
                     status.textContent = 'Aktive Streams: ' + result.ActiveStreams + ' (Jobs laufen bei weniger als ' + result.StreamLimit + '). '
                         + (result.IsBlocked ? 'Die Umwandlung pausiert gerade. ' : '')
-                        + 'Offene Jobs: ' + open + '. Warten auf Freigabe: ' + awaiting + '.';
+                        + 'Offene Jobs: ' + open + (open && duration(result.QueueEtaSeconds) ? ' (restliche Rechenzeit ' + duration(result.QueueEtaSeconds) + ')' : '')
+                        + '. Warten auf Freigabe: ' + awaiting + '.';
                     $('#ccApproveAll').disabled = awaiting === 0;
 
                     var body = $('#ccJobs');
@@ -575,7 +603,10 @@
                             bar.appendChild(fill);
                             state.appendChild(bar);
                             state.appendChild(el('div', 'ccSmall', Math.round(job.Progress * 100) + ' %'
-                                + (job.EncodeSpeed > 0 ? ' · ' + job.EncodeSpeed.toLocaleString('de-DE', { maximumFractionDigits: 2 }) + '× Echtzeit' : '')));
+                                + (job.EncodeSpeed > 0 ? ' · ' + job.EncodeSpeed.toLocaleString('de-DE', { maximumFractionDigits: 2 }) + '× Echtzeit' : '')
+                                + (duration(job.EtaSeconds) ? ' · noch ' + duration(job.EtaSeconds) : '')));
+                        } else if (job.State === 'Queued') {
+                            state.appendChild(el('div', 'ccSmall', duration(job.EtaSeconds) ? 'Rechenzeit ' + duration(job.EtaSeconds) : 'Rechenzeit noch unbekannt'));
                         }
                         if (job.Message) {
                             state.appendChild(el('div', 'ccSmall', job.Message));
@@ -640,6 +671,31 @@
                             loadItems(true).catch(function () {});
                         }
                         lastOpen = open;
+                    });
+                }
+
+                // ----- Live-Protokoll -----
+
+                var logSeq = 0;
+                var logLines = [];
+                function refreshLog() {
+                    return request('GET', 'Log?after=' + logSeq).then(function (result) {
+                        if (!result.Lines.length) {
+                            return;
+                        }
+                        var box = $('#ccLog');
+                        var atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+                        result.Lines.forEach(function (line) {
+                            logSeq = Math.max(logSeq, line.Seq);
+                            logLines.push(line.Text);
+                        });
+                        if (logLines.length > 400) {
+                            logLines = logLines.slice(-400);
+                        }
+                        box.textContent = logLines.join('\n');
+                        if (atBottom) {
+                            box.scrollTop = box.scrollHeight;
+                        }
                     });
                 }
 
@@ -776,6 +832,9 @@
                 page.addEventListener('pageshow', function () {
                     Dashboard.showLoadingMsg();
                     lastOpen = -1;
+                    logSeq = 0;
+                    logLines = [];
+                    refreshLog().catch(function () {});
                     Promise.all([loadOptions(), loadSettings(), refreshJobs()]).then(function () {
                         return loadItems(false);
                     }).then(function () {
@@ -790,6 +849,7 @@
                         }
                         if (!document.hidden && page.offsetParent !== null) {
                             refreshJobs().catch(function () {});
+                            refreshLog().catch(function () {});
                         }
                     }, 3000);
                 });

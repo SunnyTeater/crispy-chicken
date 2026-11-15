@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="utf-8">
+    <title>Codec Converter</title>
+</head>
+<body>
+    <div id="CodecConverterPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-button,emby-select,emby-input">
+        <div data-role="content">
+            <div class="content-primary">
+                <style>
+                    #CodecConverterPage .ccBox { margin: 0 0 2em; padding: 1em; border: 1px solid rgba(128, 128, 128, .35); border-radius: .4em; }
+                    #CodecConverterPage .ccBox h3 { margin: 0 0 .8em; }
+                    #CodecConverterPage .ccRow { display: flex; flex-wrap: wrap; gap: 1em; align-items: flex-end; }
+                    #CodecConverterPage .ccRow > div { flex: 1 1 12em; min-width: 0; }
+                    #CodecConverterPage .ccStatus { margin: 0 0 1.5em; padding: .8em 1em; border-radius: .4em; background: rgba(128, 128, 128, .15); }
+                    #CodecConverterPage .ccStatus.ccBlocked { background: rgba(230, 150, 0, .22); }
+                    #CodecConverterPage .ccList { max-height: 28em; overflow: auto; margin: 1em 0; border: 1px solid rgba(128, 128, 128, .25); border-radius: .3em; }
+                    #CodecConverterPage .ccItem { display: flex; align-items: center; gap: .6em; padding: .35em .6em; border-bottom: 1px solid rgba(128, 128, 128, .15); }
+                    #CodecConverterPage .ccItem input[type=checkbox] { width: 1.2em; height: 1.2em; flex: none; margin: 0; }
+                    #CodecConverterPage .ccItem .ccName { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+                    #CodecConverterPage .ccItem .ccMeta { flex: none; opacity: .75; font-size: .9em; text-align: right; white-space: nowrap; }
+                    #CodecConverterPage .ccItem.ccDisabled .ccName { opacity: .5; }
+                    #CodecConverterPage .ccGroup > .ccItem { font-weight: 600; }
+                    #CodecConverterPage .ccChildren { padding-left: 1.8em; }
+                    #CodecConverterPage .ccToggle { flex: none; width: 1.6em; padding: 0; border: 0; background: none; color: inherit; cursor: pointer; font-size: 1em; }
+                    #CodecConverterPage .ccTag { display: inline-block; margin-left: .5em; padding: 0 .4em; border-radius: .3em; font-size: .8em; font-weight: 400; background: rgba(128, 128, 128, .3); }
+                    #CodecConverterPage .ccEstimate { margin: 1em 0; padding: .8em 1em; border-radius: .4em; background: rgba(0, 164, 220, .15); font-size: 1.05em; }
+                    #CodecConverterPage .ccButtons { display: flex; flex-wrap: wrap; gap: .8em; align-items: center; }
+                    #CodecConverterPage table.ccJobs { width: 100%; border-collapse: collapse; }
+                    #CodecConverterPage table.ccJobs th, #CodecConverterPage table.ccJobs td { padding: .45em .5em; text-align: left; border-bottom: 1px solid rgba(128, 128, 128, .2); vertical-align: top; }
+                    #CodecConverterPage .ccJobsWrap { overflow-x: auto; }
+                    #CodecConverterPage .ccBar { height: .5em; min-width: 6em; border-radius: .3em; background: rgba(128, 128, 128, .3); overflow: hidden; }
+                    #CodecConverterPage .ccBar > div { height: 100%; background: #00a4dc; }
+                    #CodecConverterPage .ccSmall { font-size: .85em; opacity: .75; word-break: break-word; }
+                    #CodecConverterPage .ccWarning { margin: 0 0 1.5em; padding: .8em 1em; border-radius: .4em; background: rgba(204, 51, 51, .2); border: 1px solid #c33; }
+                </style>
+
+                <div class="verticalSection">
+                    <h2 class="sectionTitle">Codec Converter</h2>
+                    <div class="fieldDescription" style="margin-bottom: 1.5em;">
+                        Wandelt die Videospur von Filmen und Folgen mit ffmpeg in einen anderen Codec um. Tonspuren, Untertitel und Kapitel
+                        werden unverändert übernommen, Dateiname und Ordner bleiben gleich. Das Original bleibt an seinem Platz, bis die neue
+                        Datei fertig und geprüft ist, und wandert dann in den Sicherungsordner.
+                    </div>
+                </div>
+
+                <div id="ccWarning" class="ccWarning" style="display: none;"></div>
+                <div id="ccStatus" class="ccStatus">Lade …</div>
+
+                <div class="ccBox">
+                    <h3>1. Auswahl</h3>
+                    <div class="ccRow">
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="ccFilterCodec">Aktueller Codec</label>
+                            <select is="emby-select" id="ccFilterCodec" class="emby-select-withcolor emby-select"></select>
+                        </div>
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="ccFilterType">Art</label>
+                            <select is="emby-select" id="ccFilterType" class="emby-select-withcolor emby-select">
+                                <option value="">Filme und Serien</option>
+                                <option value="Movie">Nur Filme</option>
+                                <option value="Episode">Nur Serien</option>
+                            </select>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="ccFilterText">Suche</label>
+                            <input is="emby-input" id="ccFilterText" type="text" autocomplete="off" />
+                        </div>
+                    </div>
+                    <div id="ccList" class="ccList"></div>
+                    <div class="ccButtons">
+                        <button is="emby-button" type="button" id="ccSelectAll" class="raised emby-button"><span>Alle angezeigten auswählen</span></button>
+                        <button is="emby-button" type="button" id="ccSelectNone" class="raised emby-button"><span>Auswahl aufheben</span></button>
+                        <button is="emby-button" type="button" id="ccReload" class="raised emby-button"><span>Bibliothek neu einlesen</span></button>
+                    </div>
+                </div>
+
+                <div class="ccBox">
+                    <h3>2. Ziel und Verlust</h3>
+                    <div class="ccRow">
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="ccTarget">Zielcodec</label>
+                            <select is="emby-select" id="ccTarget" class="emby-select-withcolor emby-select"></select>
+                        </div>
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="ccEncoder">Encoder</label>
+                            <select is="emby-select" id="ccEncoder" class="emby-select-withcolor emby-select"></select>
+                        </div>
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="ccPreset">Verlust</label>
+                            <select is="emby-select" id="ccPreset" class="emby-select-withcolor emby-select"></select>
+                        </div>
+                        <div class="inputContainer">
+                            <label class="inputLabel inputLabelUnfocused" for="ccQuality">Qualitätswert (CRF)</label>
+                            <input is="emby-input" id="ccQuality" type="number" step="1" />
+                        </div>
+                        <div class="selectContainer">
+                            <label class="selectLabel" for="ccSpeed">Geschwindigkeit</label>
+                            <select is="emby-select" id="ccSpeed" class="emby-select-withcolor emby-select">
+                                <option value="slow">Langsam (kleinere Datei)</option>
+                                <option value="medium" selected>Mittel</option>
+                                <option value="fast">Schnell (größere Datei)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="fieldDescription" id="ccQualityHint"></div>
+                    <div id="ccEstimate" class="ccEstimate">Nichts ausgewählt.</div>
+                    <div class="ccButtons">
+                        <button is="emby-button" type="button" id="ccPlan" class="raised button-submit emby-button"><span>Zur Warteschlange hinzufügen</span></button>
+                    </div>
+                </div>
+
+                <div class="ccBox">
+                    <h3>3. Warteschlange</h3>
+                    <div class="ccJobsWrap">
+                        <table class="ccJobs">
+                            <thead><tr><th>Datei</th><th>Umwandlung</th><th>Status</th><th>Größe</th><th></th></tr></thead>
+                            <tbody id="ccJobs"></tbody>
+                        </table>
+                    </div>
+                    <div class="ccButtons" style="margin-top: 1em;">
+                        <button is="emby-button" type="button" id="ccClear" class="raised emby-button"><span>Abgeschlossene entfernen</span></button>
+                    </div>
+                </div>
+
+                <div class="ccBox">
+                    <h3>Einstellungen</h3>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ccStreamLimit">Stream-Grenze</label>
+                        <input is="emby-input" id="ccStreamLimit" type="number" min="1" max="1000" step="1" />
+                        <div class="fieldDescription">Jobs laufen nur, solange weniger Streams als dieser Wert aktiv sind. Bei 2 darf höchstens ein Stream laufen. Wird die Grenze erreicht, hält der laufende Job an und macht später weiter.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ccBackupPath">Sicherungsordner für Originale</label>
+                        <input is="emby-input" id="ccBackupPath" type="text" autocomplete="off" />
+                        <div class="fieldDescription" id="ccBackupHint"></div>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ccRetention">Originale aufbewahren (Tage)</label>
+                        <input is="emby-input" id="ccRetention" type="number" min="0" max="3650" step="1" />
+                        <div class="fieldDescription">Danach werden gesicherte Originale endgültig gelöscht. 0 = nie automatisch löschen.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ccThreads">ffmpeg-Threads</label>
+                        <input is="emby-input" id="ccThreads" type="number" min="0" max="256" step="1" />
+                        <div class="fieldDescription">0 = automatisch (alle Kerne). Ein kleinerer Wert lässt dem Server mehr Luft.</div>
+                    </div>
+                    <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ccVaapi">VAAPI-Gerät</label>
+                        <input is="emby-input" id="ccVaapi" type="text" autocomplete="off" />
+                        <div class="fieldDescription">Nur für die VAAPI-Encoder, z. B. /dev/dri/renderD128.</div>
+                    </div>
+                    <button is="emby-button" type="button" id="ccSave" class="raised button-submit emby-button"><span>Einstellungen speichern</span></button>
+                </div>
+            </div>
+        </div>
+
+        <script type="text/javascript">
+            (function () {
+                var pluginId = '7b738b42-d885-4a24-8312-97bdd0e0e32f';
+                var page = document.querySelector('#CodecConverterPage');
+                var $ = function (selector) { return page.querySelector(selector); };
+
+                var options = null;
+                var items = [];
+                var byId = {};
+                var selected = {};
+                var expanded = {};
+                var timer = null;
+                var estimateTimer = null;
+                var estimateRun = 0;
+
+                var stateLabels = {
+                    Queued: 'Wartet', Running: 'Läuft', Paused: 'Angehalten (Streams aktiv)', Finalizing: 'Wird abgeschlossen',
+                    Done: 'Fertig', Failed: 'Fehlgeschlagen', Cancelled: 'Abgebrochen'
+                };
+
+                function request(method, path, body) {
+                    return fetch(ApiClient.getUrl('CodecConverter/' + path), {
+                        method: method,
+                        headers: {
+                            'Authorization': 'MediaBrowser Token="' + ApiClient.accessToken() + '"',
+                            'Content-Type': 'application/json'
+                        },
+                        body: body ? JSON.stringify(body) : undefined
+                    }).then(function (response) {
+                        if (response.status === 204) {
+                            return {};
+                        }
+                        return response.json().catch(function () {
+                            return {};
+                        }).then(function (data) {
+                            if (!response.ok) {
+                                throw new Error(data.Message || data.title || ('HTTP ' + response.status));
+                            }
+                            return data;
+                        });
+                    });
+                }
+
+                function showError(error) {
+                    Dashboard.hideLoadingMsg();
+                    Dashboard.alert({ title: 'Codec Converter', message: error.message });
+                }
+
+                function el(tag, className, text) {
+                    var node = document.createElement(tag);
+                    if (className) {
+                        node.className = className;
+                    }
+                    if (text !== undefined && text !== null) {
+                        node.textContent = text;
+                    }
+                    return node;
+                }
+
+                function size(bytes) {
+                    if (!bytes || bytes <= 0) {
+                        return '–';
+                    }
+                    var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+                    var i = 0;
+                    while (bytes >= 1024 && i < units.length - 1) {
+                        bytes /= 1024;
+                        i++;
+                    }
+                    return bytes.toLocaleString('de-DE', { maximumFractionDigits: i < 2 ? 0 : 1 }) + ' ' + units[i];
+                }
+
+                function codecLabel(codec) {
+                    var names = { h264: 'H.264', hevc: 'H.265', av1: 'AV1', mpeg4: 'MPEG-4', mpeg2video: 'MPEG-2', vc1: 'VC-1', vp9: 'VP9', vp8: 'VP8', msmpeg4v3: 'DivX 3', wmv3: 'WMV' };
+                    return names[codec] || (codec ? codec.toUpperCase() : 'unbekannt');
+                }
+
+                function selectable(item) {
+                    return !item.Blocked && !item.Queued;
+                }
+
+                // ----- Auswahl -----
+
+                function visibleItems() {
+                    var codec = $('#ccFilterCodec').value;
+                    var type = $('#ccFilterType').value;
+                    var text = $('#ccFilterText').value.trim().toLowerCase();
+                    return items.filter(function (item) {
+                        if (codec && item.Codec !== codec) {
+                            return false;
+                        }
+                        if (type && item.Type !== type) {
+                            return false;
+                        }
+                        if (text) {
+                            var haystack = (item.Name + ' ' + (item.SeriesName || '') + ' ' + item.FileName).toLowerCase();
+                            return haystack.indexOf(text) !== -1;
+                        }
+                        return true;
+                    });
+                }
+
+                function itemRow(item, label) {
+                    var row = el('label', 'ccItem' + (selectable(item) ? '' : ' ccDisabled'));
+                    var box = el('input');
+                    box.type = 'checkbox';
+                    box.disabled = !selectable(item);
+                    box.checked = !!selected[item.Id];
+                    box.addEventListener('change', function () {
+                        if (box.checked) {
+                            selected[item.Id] = true;
+                        } else {
+                            delete selected[item.Id];
+                        }
+                        renderList();
+                        scheduleEstimate();
+                    });
+                    row.appendChild(box);
+
+                    var name = el('span', 'ccName', label);
+                    name.title = item.FileName;
+                    if (item.Queued) {
+                        name.appendChild(el('span', 'ccTag', 'in Warteschlange'));
+                    } else if (item.Blocked) {
+                        name.appendChild(el('span', 'ccTag', item.Blocked));
+                    } else if (item.VideoRange && item.VideoRange !== 'SDR' && item.VideoRange !== 'Unknown') {
+                        name.appendChild(el('span', 'ccTag', item.VideoRange));
+                    }
+                    row.appendChild(name);
+                    row.appendChild(el('span', 'ccMeta', codecLabel(item.Codec) + ' · ' + (item.Height ? item.Height + 'p' : '?') + ' · ' + size(item.Size)));
+                    return row;
+                }
+
+                function groupRow(key, label, members) {
+                    var usable = members.filter(selectable);
+                    var chosen = usable.filter(function (item) { return selected[item.Id]; }).length;
+                    var wrapper = el('div', 'ccGroup');
+                    var row = el('div', 'ccItem');
+
+                    var toggle = el('button', 'ccToggle', expanded[key] ? '▾' : '▸');
+                    toggle.type = 'button';
+                    toggle.title = expanded[key] ? 'Zuklappen' : 'Aufklappen';
+                    toggle.addEventListener('click', function () {
+                        expanded[key] = !expanded[key];
+                        renderList();
+                    });
+                    row.appendChild(toggle);
+
+                    var box = el('input');
+                    box.type = 'checkbox';
+                    box.disabled = usable.length === 0;
+                    box.checked = usable.length > 0 && chosen === usable.length;
+                    box.indeterminate = chosen > 0 && chosen < usable.length;
+                    box.addEventListener('change', function () {
+                        usable.forEach(function (item) {
+                            if (box.checked) {
+                                selected[item.Id] = true;
+                            } else {
+                                delete selected[item.Id];
+                            }
+                        });
+                        renderList();
+                        scheduleEstimate();
+                    });
+                    row.appendChild(box);
+
+                    var name = el('span', 'ccName', label);
+                    name.style.cursor = 'pointer';
+                    name.addEventListener('click', function () { toggle.click(); });
+                    row.appendChild(name);
+                    var total = members.reduce(function (sum, item) { return sum + item.Size; }, 0);
+                    row.appendChild(el('span', 'ccMeta', (chosen ? chosen + ' von ' : '') + members.length + ' Folgen · ' + size(total)));
+                    wrapper.appendChild(row);
+                    return wrapper;
+                }
+
+                function renderList() {
+                    var list = $('#ccList');
+                    var scroll = list.scrollTop;
+                    var visible = visibleItems();
+                    list.textContent = '';
+
+                    if (!visible.length) {
+                        list.appendChild(el('div', 'ccItem', items.length ? 'Kein Treffer für diesen Filter.' : 'Keine Filme oder Folgen in der Bibliothek gefunden.'));
+                        return;
+                    }
+
+                    var compare = function (a, b) { return a.localeCompare(b, 'de', { numeric: true, sensitivity: 'base' }); };
+                    var fragment = document.createDocumentFragment();
+
+                    visible.filter(function (item) { return item.Type === 'Movie'; })
+                        .sort(function (a, b) { return compare(a.Name, b.Name); })
+                        .forEach(function (item) {
+                            var year = item.Year ? '(' + item.Year + ')' : '';
+                            fragment.appendChild(itemRow(item, item.Name + (year && item.Name.indexOf(year) === -1 ? ' ' + year : '')));
+                        });
+
+                    var series = {};
+                    visible.filter(function (item) { return item.Type === 'Episode'; }).forEach(function (item) {
+                        var key = item.SeriesId || item.SeriesName;
+                        (series[key] = series[key] || { name: item.SeriesName || 'Unbekannte Serie', episodes: [] }).episodes.push(item);
+                    });
+
+                    Object.keys(series).sort(function (a, b) { return compare(series[a].name, series[b].name); }).forEach(function (seriesKey) {
+                        var show = series[seriesKey];
+                        var showNode = groupRow('s:' + seriesKey, show.name, show.episodes);
+                        fragment.appendChild(showNode);
+                        if (!expanded['s:' + seriesKey]) {
+                            return;
+                        }
+
+                        var seasons = {};
+                        show.episodes.forEach(function (item) {
+                            var number = item.Season === null || item.Season === undefined ? -1 : item.Season;
+                            (seasons[number] = seasons[number] || []).push(item);
+                        });
+
+                        var showChildren = el('div', 'ccChildren');
+                        Object.keys(seasons).map(Number).sort(function (a, b) { return a - b; }).forEach(function (number) {
+                            var seasonKey = 's:' + seriesKey + ':' + number;
+                            var label = number === -1 ? 'Ohne Staffel' : (number === 0 ? 'Specials' : 'Staffel ' + number);
+                            var seasonNode = groupRow(seasonKey, label, seasons[number]);
+                            showChildren.appendChild(seasonNode);
+                            if (!expanded[seasonKey]) {
+                                return;
+                            }
+
+                            var seasonChildren = el('div', 'ccChildren');
+                            seasons[number].sort(function (a, b) { return (a.Episode || 0) - (b.Episode || 0) || compare(a.Name, b.Name); }).forEach(function (item) {
+                                var prefix = item.Episode !== null && item.Episode !== undefined ? 'E' + ('0' + item.Episode).slice(-2) + ' – ' : '';
+                                seasonChildren.appendChild(itemRow(item, prefix + item.Name));
+                            });
+                            seasonNode.appendChild(seasonChildren);
+                        });
+                        showNode.appendChild(showChildren);
+                    });
+
+                    list.appendChild(fragment);
+                    list.scrollTop = scroll;
+                }
+
+                function renderCodecFilter() {
+                    var select = $('#ccFilterCodec');
+                    var current = select.value;
+                    var counts = {};
+                    items.forEach(function (item) {
+                        counts[item.Codec] = (counts[item.Codec] || 0) + 1;
+                    });
+                    select.textContent = '';
+                    var all = el('option', null, 'Alle Codecs (' + items.length + ')');
+                    all.value = '';
+                    select.appendChild(all);
+                    Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; }).forEach(function (codec) {
+                        var option = el('option', null, codecLabel(codec) + ' (' + counts[codec] + ')');
+                        option.value = codec;
+                        select.appendChild(option);
+                    });
+                    select.value = counts[current] ? current : '';
+                }
+
+                function loadItems(refresh) {
+                    return request('GET', 'Items' + (refresh ? '?refresh=true' : '')).then(function (result) {
+                        items = result;
+                        byId = {};
+                        items.forEach(function (item) { byId[item.Id] = item; });
+                        Object.keys(selected).forEach(function (id) {
+                            if (!byId[id] || !selectable(byId[id])) {
+                                delete selected[id];
+                            }
+                        });
+                        renderCodecFilter();
+                        renderList();
+                        scheduleEstimate();
+                    });
+                }
+
+                // ----- Ziel -----
+
+                function currentTarget() {
+                    var codec = $('#ccTarget').value;
+                    return options.Targets.filter(function (target) { return target.Codec === codec; })[0];
+                }
+
+                function renderTarget() {
+                    var target = currentTarget();
+                    var encoder = $('#ccEncoder');
+                    encoder.textContent = '';
+                    target.Encoders.forEach(function (info) {
+                        var option = el('option', null, info.Label + (info.Available ? '' : ' (in ffmpeg nicht vorhanden)'));
+                        option.value = info.Name;
+                        option.disabled = !info.Available;
+                        encoder.appendChild(option);
+                    });
+                    var firstAvailable = target.Encoders.filter(function (info) { return info.Available; })[0];
+                    encoder.value = firstAvailable ? firstAvailable.Name : '';
+
+                    var preset = $('#ccPreset');
+                    preset.textContent = '';
+                    target.Presets.forEach(function (info) {
+                        var option = el('option', null, info.Label);
+                        option.value = info.Value;
+                        preset.appendChild(option);
+                    });
+                    var custom = el('option', null, 'Eigener Wert');
+                    custom.value = 'custom';
+                    preset.appendChild(custom);
+                    preset.value = target.Presets[1].Value;
+
+                    var quality = $('#ccQuality');
+                    quality.min = target.MinQuality;
+                    quality.max = target.MaxQuality;
+                    quality.value = target.Presets[1].Value;
+                    $('#ccQualityHint').textContent = 'Qualitätswert von ' + target.MinQuality + ' bis ' + target.MaxQuality
+                        + ': je kleiner, desto weniger Verlust und desto größer die Datei. Bei Hardware-Encodern wird der Wert als konstante Qualität übergeben und fällt bei gleicher Zahl etwas schlechter aus.';
+                    scheduleEstimate();
+                }
+
+                function buildRequest() {
+                    return {
+                        ItemIds: Object.keys(selected),
+                        TargetCodec: $('#ccTarget').value,
+                        Encoder: $('#ccEncoder').value,
+                        Quality: parseInt($('#ccQuality').value, 10),
+                        Speed: $('#ccSpeed').value
+                    };
+                }
+
+                function scheduleEstimate() {
+                    clearTimeout(estimateTimer);
+                    estimateTimer = setTimeout(updateEstimate, 250);
+                }
+
+                function updateEstimate() {
+                    var box = $('#ccEstimate');
+                    var body = buildRequest();
+                    if (!body.ItemIds.length) {
+                        box.textContent = 'Nichts ausgewählt.';
+                        return;
+                    }
+                    if (!body.Encoder || isNaN(body.Quality)) {
+                        box.textContent = 'Bitte Encoder und Qualitätswert wählen.';
+                        return;
+                    }
+
+                    var run = ++estimateRun;
+                    request('POST', 'Estimate', body).then(function (result) {
+                        if (run !== estimateRun) {
+                            return;
+                        }
+                        var saved = result.SourceBytes - result.EstimatedBytes;
+                        var percent = result.SourceBytes > 0 ? Math.round(saved / result.SourceBytes * 100) : 0;
+                        box.textContent = result.Count + (result.Count === 1 ? ' Datei' : ' Dateien') + ': ' + size(result.SourceBytes)
+                            + ' → ca. ' + size(result.EstimatedBytes) + ' (spart ca. ' + size(saved) + ', ' + percent + ' %). '
+                            + 'Grobe Schätzung aus Auflösung, Laufzeit und Qualitätswert, das Ergebnis kann je nach Bildinhalt deutlich abweichen.';
+                    }).catch(function (error) {
+                        if (run === estimateRun) {
+                            box.textContent = error.message;
+                        }
+                    });
+                }
+
+                // ----- Warteschlange -----
+
+                function renderJobs(result) {
+                    var status = $('#ccStatus');
+                    var open = result.Jobs.filter(function (job) { return ['Queued', 'Running', 'Paused', 'Finalizing'].indexOf(job.State) !== -1; }).length;
+                    status.className = 'ccStatus' + (result.IsBlocked ? ' ccBlocked' : '');
+                    status.textContent = 'Aktive Streams: ' + result.ActiveStreams + ' (Jobs laufen bei weniger als ' + result.StreamLimit + '). '
+                        + (result.IsBlocked ? 'Die Umwandlung pausiert gerade. ' : '')
+                        + 'Offene Jobs: ' + open + '.';
+
+                    var body = $('#ccJobs');
+                    body.textContent = '';
+                    if (!result.Jobs.length) {
+                        var empty = el('tr');
+                        var cell = el('td', 'ccSmall', 'Die Warteschlange ist leer.');
+                        cell.colSpan = 5;
+                        empty.appendChild(cell);
+                        body.appendChild(empty);
+                        return;
+                    }
+
+                    result.Jobs.forEach(function (job) {
+                        var row = el('tr');
+                        row.appendChild(el('td', null, job.Name));
+                        row.appendChild(el('td', null, codecLabel(job.SourceCodec) + ' → ' + codecLabel(job.TargetCodec) + ' (' + job.Encoder + ', ' + job.Quality + ')'));
+
+                        var state = el('td');
+                        state.appendChild(el('div', null, stateLabels[job.State] || job.State));
+                        if (job.State === 'Running' || job.State === 'Paused') {
+                            var bar = el('div', 'ccBar');
+                            var fill = el('div');
+                            fill.style.width = Math.round(job.Progress * 100) + '%';
+                            bar.appendChild(fill);
+                            state.appendChild(bar);
+                            state.appendChild(el('div', 'ccSmall', Math.round(job.Progress * 100) + ' %'
+                                + (job.EncodeSpeed > 0 ? ' · ' + job.EncodeSpeed.toLocaleString('de-DE', { maximumFractionDigits: 2 }) + '× Echtzeit' : '')));
+                        }
+                        if (job.Message) {
+                            state.appendChild(el('div', 'ccSmall', job.Message));
+                        }
+                        row.appendChild(state);
+
+                        var sizes = size(job.SourceSize) + ' → ' + (job.ResultSize ? size(job.ResultSize) : 'ca. ' + size(job.EstimatedSize));
+                        row.appendChild(el('td', null, sizes));
+
+                        var action = el('td');
+                        if (job.State !== 'Finalizing') {
+                            var finished = ['Done', 'Failed', 'Cancelled'].indexOf(job.State) !== -1;
+                            var button = el('button', 'raised emby-button', finished ? 'Entfernen' : 'Abbrechen');
+                            button.type = 'button';
+                            button.addEventListener('click', function () {
+                                request('DELETE', 'Jobs/' + encodeURIComponent(job.Id)).then(function () {
+                                    return refreshJobs();
+                                }).then(function () {
+                                    return loadItems(false);
+                                }).catch(showError);
+                            });
+                            action.appendChild(button);
+                        }
+                        row.appendChild(action);
+                        body.appendChild(row);
+                    });
+                }
+
+                var lastOpen = -1;
+                var ticks = 0;
+                function refreshJobs() {
+                    return request('GET', 'Jobs').then(function (result) {
+                        renderJobs(result);
+                        var open = result.Jobs.filter(function (job) { return ['Queued', 'Running', 'Paused', 'Finalizing'].indexOf(job.State) !== -1; }).length;
+
+                        // Nach einem fertigen Job dauert es etwa eine Minute, bis Jellyfin die neue Datei eingelesen hat.
+                        // Bis dahin die Auswahl regelmaessig auffrischen.
+                        var waiting = items.some(function (item) { return item.Blocked && item.Blocked.indexOf('Gerade umgewandelt') === 0; });
+                        ticks++;
+                        if ((lastOpen !== -1 && open < lastOpen) || (waiting && ticks % 5 === 0)) {
+                            loadItems(true).catch(function () {});
+                        }
+                        lastOpen = open;
+                    });
+                }
+
+                // ----- Einstellungen -----
+
+                function loadSettings() {
+                    return ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        $('#ccStreamLimit').value = config.StreamLimit;
+                        $('#ccBackupPath').value = config.BackupPath || '';
+                        $('#ccRetention').value = config.BackupRetentionDays;
+                        $('#ccThreads').value = config.Threads;
+                        $('#ccVaapi').value = config.VaapiDevice || '';
+                    });
+                }
+
+                function loadOptions() {
+                    return request('GET', 'Options').then(function (result) {
+                        options = result;
+                        var warning = $('#ccWarning');
+                        var messages = [];
+                        if (result.BackupError) {
+                            messages.push(result.BackupError);
+                        }
+                        if (!result.CanPause) {
+                            messages.push('Unter Windows kann ein laufender Job nicht angehalten werden: er läuft zu Ende, auch wenn Streams starten. Neue Jobs warten trotzdem.');
+                        }
+                        warning.style.display = messages.length ? '' : 'none';
+                        warning.textContent = messages.join(' ');
+                        $('#ccBackupHint').textContent = 'Leer lassen für den Standardordner. Aktuell: ' + (result.BackupRoot || 'ungültig')
+                            + '. Der Ordner darf nicht in einer Bibliothek liegen und muss für den Jellyfin-Dienst beschreibbar sein.';
+
+                        var target = $('#ccTarget');
+                        if (!target.options.length) {
+                            result.Targets.forEach(function (info) {
+                                var option = el('option', null, info.Label);
+                                option.value = info.Codec;
+                                target.appendChild(option);
+                            });
+                            renderTarget();
+                        }
+                    });
+                }
+
+                // ----- Ereignisse -----
+
+                ['#ccFilterCodec', '#ccFilterType'].forEach(function (selector) {
+                    $(selector).addEventListener('change', renderList);
+                });
+                $('#ccFilterText').addEventListener('input', renderList);
+
+                $('#ccSelectAll').addEventListener('click', function () {
+                    visibleItems().filter(selectable).forEach(function (item) { selected[item.Id] = true; });
+                    renderList();
+                    scheduleEstimate();
+                });
+                $('#ccSelectNone').addEventListener('click', function () {
+                    selected = {};
+                    renderList();
+                    scheduleEstimate();
+                });
+                $('#ccReload').addEventListener('click', function () {
+                    Dashboard.showLoadingMsg();
+                    loadItems(true).then(function () { Dashboard.hideLoadingMsg(); }).catch(showError);
+                });
+
+                $('#ccTarget').addEventListener('change', renderTarget);
+                $('#ccEncoder').addEventListener('change', scheduleEstimate);
+                $('#ccSpeed').addEventListener('change', scheduleEstimate);
+                $('#ccPreset').addEventListener('change', function () {
+                    if ($('#ccPreset').value !== 'custom') {
+                        $('#ccQuality').value = $('#ccPreset').value;
+                    }
+                    scheduleEstimate();
+                });
+                $('#ccQuality').addEventListener('input', function () {
+                    var value = $('#ccQuality').value;
+                    var match = currentTarget().Presets.filter(function (info) { return String(info.Value) === value; })[0];
+                    $('#ccPreset').value = match ? match.Value : 'custom';
+                    scheduleEstimate();
+                });
+
+                $('#ccPlan').addEventListener('click', function () {
+                    var body = buildRequest();
+                    if (!body.ItemIds.length) {
+                        Dashboard.alert({ title: 'Codec Converter', message: 'Bitte zuerst Filme oder Folgen auswählen.' });
+                        return;
+                    }
+                    Dashboard.showLoadingMsg();
+                    request('POST', 'Jobs', body).then(function (result) {
+                        Dashboard.hideLoadingMsg();
+                        selected = {};
+                        var message = result.Added + (result.Added === 1 ? ' Job' : ' Jobs') + ' hinzugefügt.';
+                        if (result.Skipped.length) {
+                            message += ' Übersprungen: ' + result.Skipped.slice(0, 10).join('; ') + (result.Skipped.length > 10 ? ' und ' + (result.Skipped.length - 10) + ' weitere' : '') + '.';
+                        }
+                        Dashboard.alert({ title: 'Codec Converter', message: message });
+                        return Promise.all([loadItems(false), refreshJobs()]);
+                    }).catch(showError);
+                });
+
+                $('#ccClear').addEventListener('click', function () {
+                    request('POST', 'Jobs/ClearFinished').then(refreshJobs).catch(showError);
+                });
+
+                $('#ccSave').addEventListener('click', function () {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.getPluginConfiguration(pluginId).then(function (config) {
+                        config.StreamLimit = Math.max(1, parseInt($('#ccStreamLimit').value, 10) || 2);
+                        config.BackupPath = $('#ccBackupPath').value.trim();
+                        config.BackupRetentionDays = Math.max(0, parseInt($('#ccRetention').value, 10) || 0);
+                        config.Threads = Math.max(0, parseInt($('#ccThreads').value, 10) || 0);
+                        config.VaapiDevice = $('#ccVaapi').value.trim();
+                        return ApiClient.updatePluginConfiguration(pluginId, config);
+                    }).then(function (result) {
+                        Dashboard.processPluginConfigurationUpdateResult(result);
+                        return Promise.all([loadOptions(), refreshJobs()]);
+                    }).catch(showError);
+                });
+
+                function stopTimer() {
+                    if (timer) {
+                        clearInterval(timer);
+                        timer = null;
+                    }
+                }
+
+                page.addEventListener('pageshow', function () {
+                    Dashboard.showLoadingMsg();
+                    lastOpen = -1;
+                    Promise.all([loadOptions(), loadSettings(), refreshJobs()]).then(function () {
+                        return loadItems(false);
+                    }).then(function () {
+                        Dashboard.hideLoadingMsg();
+                    }).catch(showError);
+
+                    stopTimer();
+                    timer = setInterval(function () {
+                        if (!document.body.contains(page)) {
+                            stopTimer();
+                            return;
+                        }
+                        if (!document.hidden && page.offsetParent !== null) {
+                            refreshJobs().catch(function () {});
+                        }
+                    }, 3000);
+                });
+                page.addEventListener('pagehide', stopTimer);
+                page.addEventListener('viewhide', stopTimer);
+            })();
+        </script>
+    </div>
+</body>
+</html>

@@ -61,37 +61,6 @@ public sealed class JobStore
     }
 
     /// <summary>
-    /// Liefert die Item-Ids, fuer die ein noch offener Job existiert.
-    /// </summary>
-    /// <returns>Die Ids.</returns>
-    public HashSet<Guid> OpenItemIds()
-    {
-        lock (_lock)
-        {
-            return _jobs.Where(IsOpen).Select(j => j.ItemId).ToHashSet();
-        }
-    }
-
-    /// <summary>
-    /// Liefert zu kuerzlich fertig gewordenen Jobs die Groesse der alten Datei. Solange die Bibliothek
-    /// fuer ein Element noch diese Groesse meldet, hat Jellyfin die neue Datei noch nicht eingelesen.
-    /// </summary>
-    /// <returns>Item-Id und Groesse des Originals.</returns>
-    public Dictionary<Guid, long> RecentlyConverted()
-    {
-        lock (_lock)
-        {
-            var result = new Dictionary<Guid, long>();
-            foreach (var job in _jobs.Where(j => j.State == JobState.Done && j.Finished > DateTime.UtcNow.AddMinutes(-15)))
-            {
-                result[job.ItemId] = job.SourceSize;
-            }
-
-            return result;
-        }
-    }
-
-    /// <summary>
     /// Fuegt Jobs hinzu.
     /// </summary>
     /// <param name="jobs">Die neuen Jobs.</param>
@@ -186,7 +155,38 @@ public sealed class JobStore
     /// <param name="job">Der Job.</param>
     /// <returns>True, wenn offen.</returns>
     public static bool IsOpen(Job job)
-        => job.State is JobState.Queued or JobState.Running or JobState.Paused or JobState.Finalizing;
+        => job.State is JobState.Queued or JobState.Running or JobState.Paused or JobState.Finalizing or JobState.AwaitingApproval;
+
+    /// <summary>
+    /// Liefert zu jedem Element mit offenem Job dessen Zustand.
+    /// </summary>
+    /// <returns>Item-Id und Zustand.</returns>
+    public Dictionary<Guid, JobState> OpenItemStates()
+    {
+        lock (_lock)
+        {
+            var result = new Dictionary<Guid, JobState>();
+            foreach (var job in _jobs.Where(IsOpen))
+            {
+                result[job.ItemId] = job.State;
+            }
+
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Liefert die Ids der Jobs in einem Zustand.
+    /// </summary>
+    /// <param name="state">Der Zustand.</param>
+    /// <returns>Die Job-Ids, aelteste zuerst.</returns>
+    public List<string> IdsInState(JobState state)
+    {
+        lock (_lock)
+        {
+            return _jobs.Where(j => j.State == state).OrderBy(j => j.Created).Select(j => j.Id).ToList();
+        }
+    }
 
     private static Job Clone(Job job) => (Job)JsonSerializer.Deserialize(JsonSerializer.Serialize(job, _json), typeof(Job), _json)!;
 

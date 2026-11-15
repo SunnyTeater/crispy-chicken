@@ -65,7 +65,23 @@ public enum JobState
     Finalizing,
     Done,
     Failed,
-    Cancelled
+    Cancelled,
+
+    /// <summary>Neue Datei liegt neben dem Original, das Original wartet auf die Freigabe zum Loeschen.</summary>
+    AwaitingApproval,
+
+    /// <summary>Neue Datei verworfen, Original behalten.</summary>
+    Rejected
+}
+
+/// <summary>
+/// Eine Begleitdatei (externer Untertitel), die fuer die neue Videodatei kopiert wurde.
+/// </summary>
+public sealed class SidecarCopy
+{
+    public string Original { get; set; } = string.Empty;
+
+    public string Copy { get; set; } = string.Empty;
 }
 
 /// <summary>
@@ -120,6 +136,32 @@ public sealed class Job
     public DateTime? Started { get; set; }
 
     public DateTime? Finished { get; set; }
+
+    /// <summary>Gets or sets den Zeitpunkt, zu dem die neue Datei fertig war. Ab hier laeuft die Frist der automatischen Freigabe.</summary>
+    public DateTime? Converted { get; set; }
+
+    public List<SidecarCopy> Sidecars { get; set; } = new();
+
+    /// <summary>Gets or sets den Gesehen-Stand der Benutzer, der nach der Freigabe noch auf die neue Datei zu uebertragen ist.</summary>
+    public List<UserState> PendingUserStates { get; set; } = new();
+}
+
+/// <summary>
+/// Gesehen-Stand eines Benutzers fuer eine Datei.
+/// </summary>
+public sealed class UserState
+{
+    public Guid UserId { get; set; }
+
+    public bool Played { get; set; }
+
+    public bool IsFavorite { get; set; }
+
+    public long PlaybackPositionTicks { get; set; }
+
+    public int PlayCount { get; set; }
+
+    public DateTime? LastPlayedDate { get; set; }
 }
 
 /// <summary>

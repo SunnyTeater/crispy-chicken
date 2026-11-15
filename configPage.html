@@ -40,8 +40,9 @@
                     <h2 class="sectionTitle">Codec Converter</h2>
                     <div class="fieldDescription" style="margin-bottom: 1.5em;">
                         Wandelt die Videospur von Filmen und Folgen mit ffmpeg in einen anderen Codec um. Tonspuren, Untertitel und Kapitel
-                        werden unverändert übernommen, Dateiname und Ordner bleiben gleich. Das Original bleibt an seinem Platz, bis die neue
-                        Datei fertig und geprüft ist, und wandert dann in den Sicherungsordner.
+                        werden unverändert übernommen. Die neue Datei wird neben das Original gelegt und trägt den neuen Codec im Namen
+                        (aus „x264“ wird „x265“, sonst wird z. B. „ - HEVC“ angehängt). In Jellyfin lassen sich beide als Versionen auswählen.
+                        Erst mit der Freigabe wird das Original gelöscht.
                     </div>
                 </div>
 
@@ -105,6 +106,12 @@
                         </div>
                     </div>
                     <div class="fieldDescription" id="ccQualityHint"></div>
+                    <div class="fieldDescription">
+                        <b>Verlust / Qualitätswert:</b> Der Encoder hält die Bildqualität über den ganzen Film gleich. 6 Stufen mehr halbieren die Datei ungefähr,
+                        6 Stufen weniger verdoppeln sie. Verlorene Qualität kommt nicht zurück: ein sehr kleiner Wert macht eine schon komprimierte Quelle nicht besser, nur größer.<br>
+                        <b>Geschwindigkeit:</b> wie viel Rechenzeit der Encoder aufwendet. Langsam ergibt bei gleicher Qualität die kleinste Datei, Schnell die größte. Die Qualität legt der Qualitätswert fest.<br>
+                        <b>Encoder:</b> Mit NVENC laufen Dekodieren und Kodieren auf der Grafikkarte. Welcher Encoder benutzt wurde, steht in der Warteschlange in der Spalte „Umwandlung“.
+                    </div>
                     <div id="ccEstimate" class="ccEstimate">Nichts ausgewählt.</div>
                     <div class="ccButtons">
                         <button is="emby-button" type="button" id="ccPlan" class="raised button-submit emby-button"><span>Zur Warteschlange hinzufügen</span></button>
@@ -120,6 +127,7 @@
                         </table>
                     </div>
                     <div class="ccButtons" style="margin-top: 1em;">
+                        <button is="emby-button" type="button" id="ccApproveAll" class="raised button-submit emby-button"><span>Alle freigeben</span></button>
                         <button is="emby-button" type="button" id="ccClear" class="raised emby-button"><span>Abgeschlossene entfernen</span></button>
                     </div>
                 </div>
@@ -132,14 +140,9 @@
                         <div class="fieldDescription">Jobs laufen nur, solange weniger Streams als dieser Wert aktiv sind. Bei 2 darf höchstens ein Stream laufen. Wird die Grenze erreicht, hält der laufende Job an und macht später weiter.</div>
                     </div>
                     <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="ccBackupPath">Sicherungsordner für Originale</label>
-                        <input is="emby-input" id="ccBackupPath" type="text" autocomplete="off" />
-                        <div class="fieldDescription" id="ccBackupHint"></div>
-                    </div>
-                    <div class="inputContainer">
-                        <label class="inputLabel inputLabelUnfocused" for="ccRetention">Originale aufbewahren (Tage)</label>
-                        <input is="emby-input" id="ccRetention" type="number" min="0" max="3650" step="1" />
-                        <div class="fieldDescription">Danach werden gesicherte Originale endgültig gelöscht. 0 = nie automatisch löschen.</div>
+                        <label class="inputLabel inputLabelUnfocused" for="ccAutoApprove">Automatische Freigabe nach (Tagen)</label>
+                        <input is="emby-input" id="ccAutoApprove" type="number" min="0" max="3650" step="1" />
+                        <div class="fieldDescription">So lange nach der Umwandlung wird das Original automatisch gelöscht, wenn es bis dahin niemand freigegeben oder verworfen hat. 0 = nie automatisch, nur von Hand.</div>
                     </div>
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="ccThreads">ffmpeg-Threads</label>
@@ -173,8 +176,18 @@
 
                 var stateLabels = {
                     Queued: 'Wartet', Running: 'Läuft', Paused: 'Angehalten (Streams aktiv)', Finalizing: 'Wird abgeschlossen',
-                    Done: 'Fertig', Failed: 'Fehlgeschlagen', Cancelled: 'Abgebrochen'
+                    Done: 'Fertig, Original gelöscht', Failed: 'Fehlgeschlagen', Cancelled: 'Abgebrochen',
+                    AwaitingApproval: 'Wartet auf Freigabe', Rejected: 'Verworfen'
                 };
+                var runningStates = ['Queued', 'Running', 'Paused', 'Finalizing'];
+
+                function confirmAction(message, action) {
+                    Dashboard.confirm(message, 'Codec Converter', function (confirmed) {
+                        if (confirmed) {
+                            action();
+                        }
+                    });
+                }
 
                 function request(method, path, body) {
                     return fetch(ApiClient.getUrl('CodecConverter/' + path), {
@@ -442,6 +455,8 @@
                 function renderTarget() {
                     var target = currentTarget();
                     var encoder = $('#ccEncoder');
+                    // Beim Wechsel des Zielcodecs die Encoder-Art behalten (z. B. NVENC bleibt NVENC).
+                    var previousKind = (encoder.value || '').split('_')[1] || '';
                     encoder.textContent = '';
                     target.Encoders.forEach(function (info) {
                         var option = el('option', null, info.Label + (info.Available ? '' : ' (in ffmpeg nicht vorhanden)'));
@@ -449,8 +464,10 @@
                         option.disabled = !info.Available;
                         encoder.appendChild(option);
                     });
-                    var firstAvailable = target.Encoders.filter(function (info) { return info.Available; })[0];
-                    encoder.value = firstAvailable ? firstAvailable.Name : '';
+                    var available = target.Encoders.filter(function (info) { return info.Available; });
+                    var sameKind = available.filter(function (info) { return previousKind && info.Name.split('_')[1] === previousKind; })[0];
+                    var chosen = sameKind || available[0];
+                    encoder.value = chosen ? chosen.Name : '';
 
                     var preset = $('#ccPreset');
                     preset.textContent = '';
@@ -521,11 +538,13 @@
 
                 function renderJobs(result) {
                     var status = $('#ccStatus');
-                    var open = result.Jobs.filter(function (job) { return ['Queued', 'Running', 'Paused', 'Finalizing'].indexOf(job.State) !== -1; }).length;
+                    var open = result.Jobs.filter(function (job) { return runningStates.indexOf(job.State) !== -1; }).length;
+                    var awaiting = result.Jobs.filter(function (job) { return job.State === 'AwaitingApproval'; }).length;
                     status.className = 'ccStatus' + (result.IsBlocked ? ' ccBlocked' : '');
                     status.textContent = 'Aktive Streams: ' + result.ActiveStreams + ' (Jobs laufen bei weniger als ' + result.StreamLimit + '). '
                         + (result.IsBlocked ? 'Die Umwandlung pausiert gerade. ' : '')
-                        + 'Offene Jobs: ' + open + '.';
+                        + 'Offene Jobs: ' + open + '. Warten auf Freigabe: ' + awaiting + '.';
+                    $('#ccApproveAll').disabled = awaiting === 0;
 
                     var body = $('#ccJobs');
                     body.textContent = '';
@@ -540,7 +559,11 @@
 
                     result.Jobs.forEach(function (job) {
                         var row = el('tr');
-                        row.appendChild(el('td', null, job.Name));
+                        var nameCell = el('td', null, job.Name);
+                        if (job.State === 'AwaitingApproval' || job.State === 'Done') {
+                            nameCell.appendChild(el('div', 'ccSmall', 'Neu: ' + job.TargetName));
+                        }
+                        row.appendChild(nameCell);
                         row.appendChild(el('td', null, codecLabel(job.SourceCodec) + ' → ' + codecLabel(job.TargetCodec) + ' (' + job.Encoder + ', ' + job.Quality + ')'));
 
                         var state = el('td');
@@ -557,24 +580,42 @@
                         if (job.Message) {
                             state.appendChild(el('div', 'ccSmall', job.Message));
                         }
+                        if (job.State === 'AwaitingApproval') {
+                            state.appendChild(el('div', 'ccSmall', job.AutoApproveAt
+                                ? 'Automatische Freigabe am ' + new Date(job.AutoApproveAt).toLocaleDateString('de-DE') + '.'
+                                : 'Keine automatische Freigabe eingestellt.'));
+                        }
                         row.appendChild(state);
 
                         var sizes = size(job.SourceSize) + ' → ' + (job.ResultSize ? size(job.ResultSize) : 'ca. ' + size(job.EstimatedSize));
                         row.appendChild(el('td', null, sizes));
 
                         var action = el('td');
-                        if (job.State !== 'Finalizing') {
-                            var finished = ['Done', 'Failed', 'Cancelled'].indexOf(job.State) !== -1;
-                            var button = el('button', 'raised emby-button', finished ? 'Entfernen' : 'Abbrechen');
+                        var addButton = function (label, className, handler) {
+                            var button = el('button', 'raised emby-button' + (className ? ' ' + className : ''), label);
                             button.type = 'button';
-                            button.addEventListener('click', function () {
-                                request('DELETE', 'Jobs/' + encodeURIComponent(job.Id)).then(function () {
-                                    return refreshJobs();
-                                }).then(function () {
-                                    return loadItems(false);
-                                }).catch(showError);
-                            });
+                            button.style.margin = '0 .4em .4em 0';
+                            button.addEventListener('click', handler);
                             action.appendChild(button);
+                        };
+                        var reload = function () {
+                            return refreshJobs().then(function () { return loadItems(false); });
+                        };
+                        if (job.State === 'AwaitingApproval') {
+                            addButton('Freigeben', 'button-submit', function () {
+                                confirmAction('Original „' + job.SourceName + '“ endgültig löschen und „' + job.TargetName + '“ behalten?', function () {
+                                    request('POST', 'Jobs/' + encodeURIComponent(job.Id) + '/Approve').then(reload).catch(showError);
+                                });
+                            });
+                            addButton('Verwerfen', '', function () {
+                                confirmAction('Neue Datei „' + job.TargetName + '“ löschen und das Original behalten?', function () {
+                                    request('POST', 'Jobs/' + encodeURIComponent(job.Id) + '/Reject').then(reload).catch(showError);
+                                });
+                            });
+                        } else if (job.State !== 'Finalizing') {
+                            addButton(runningStates.indexOf(job.State) !== -1 ? 'Abbrechen' : 'Entfernen', '', function () {
+                                request('DELETE', 'Jobs/' + encodeURIComponent(job.Id)).then(reload).catch(showError);
+                            });
                         }
                         row.appendChild(action);
                         body.appendChild(row);
@@ -583,16 +624,19 @@
 
                 var lastOpen = -1;
                 var ticks = 0;
+                var refreshUntil = 0;
                 function refreshJobs() {
                     return request('GET', 'Jobs').then(function (result) {
                         renderJobs(result);
-                        var open = result.Jobs.filter(function (job) { return ['Queued', 'Running', 'Paused', 'Finalizing'].indexOf(job.State) !== -1; }).length;
+                        var open = result.Jobs.filter(function (job) { return runningStates.indexOf(job.State) !== -1; }).length;
 
                         // Nach einem fertigen Job dauert es etwa eine Minute, bis Jellyfin die neue Datei eingelesen hat.
-                        // Bis dahin die Auswahl regelmaessig auffrischen.
-                        var waiting = items.some(function (item) { return item.Blocked && item.Blocked.indexOf('Gerade umgewandelt') === 0; });
+                        // In dieser Zeit die Auswahl regelmaessig auffrischen.
                         ticks++;
-                        if ((lastOpen !== -1 && open < lastOpen) || (waiting && ticks % 5 === 0)) {
+                        if (lastOpen !== -1 && open < lastOpen) {
+                            refreshUntil = Date.now() + 120000;
+                            loadItems(true).catch(function () {});
+                        } else if (Date.now() < refreshUntil && ticks % 5 === 0) {
                             loadItems(true).catch(function () {});
                         }
                         lastOpen = open;
@@ -604,8 +648,7 @@
                 function loadSettings() {
                     return ApiClient.getPluginConfiguration(pluginId).then(function (config) {
                         $('#ccStreamLimit').value = config.StreamLimit;
-                        $('#ccBackupPath').value = config.BackupPath || '';
-                        $('#ccRetention').value = config.BackupRetentionDays;
+                        $('#ccAutoApprove').value = config.AutoApproveDays;
                         $('#ccThreads').value = config.Threads;
                         $('#ccVaapi').value = config.VaapiDevice || '';
                     });
@@ -616,17 +659,11 @@
                         options = result;
                         var warning = $('#ccWarning');
                         var messages = [];
-                        if (result.BackupError) {
-                            messages.push(result.BackupError);
-                        }
                         if (!result.CanPause) {
                             messages.push('Unter Windows kann ein laufender Job nicht angehalten werden: er läuft zu Ende, auch wenn Streams starten. Neue Jobs warten trotzdem.');
                         }
                         warning.style.display = messages.length ? '' : 'none';
                         warning.textContent = messages.join(' ');
-                        $('#ccBackupHint').textContent = 'Leer lassen für den Standardordner. Aktuell: ' + (result.BackupRoot || 'ungültig')
-                            + '. Der Ordner darf nicht in einer Bibliothek liegen und muss für den Jellyfin-Dienst beschreibbar sein.';
-
                         var target = $('#ccTarget');
                         if (!target.options.length) {
                             result.Targets.forEach(function (info) {
@@ -696,6 +733,21 @@
                     }).catch(showError);
                 });
 
+                $('#ccApproveAll').addEventListener('click', function () {
+                    confirmAction('Alle wartenden Umwandlungen freigeben? Die Originale werden endgültig gelöscht.', function () {
+                        Dashboard.showLoadingMsg();
+                        request('POST', 'Jobs/ApproveAll').then(function (result) {
+                            Dashboard.hideLoadingMsg();
+                            var message = result.Approved + (result.Approved === 1 ? ' Datei' : ' Dateien') + ' freigegeben.';
+                            if (result.Errors.length) {
+                                message += ' Nicht freigegeben: ' + result.Errors.slice(0, 10).join('; ') + '.';
+                            }
+                            Dashboard.alert({ title: 'Codec Converter', message: message });
+                            return refreshJobs().then(function () { return loadItems(false); });
+                        }).catch(showError);
+                    });
+                });
+
                 $('#ccClear').addEventListener('click', function () {
                     request('POST', 'Jobs/ClearFinished').then(refreshJobs).catch(showError);
                 });
@@ -704,8 +756,7 @@
                     Dashboard.showLoadingMsg();
                     ApiClient.getPluginConfiguration(pluginId).then(function (config) {
                         config.StreamLimit = Math.max(1, parseInt($('#ccStreamLimit').value, 10) || 2);
-                        config.BackupPath = $('#ccBackupPath').value.trim();
-                        config.BackupRetentionDays = Math.max(0, parseInt($('#ccRetention').value, 10) || 0);
+                        config.AutoApproveDays = Math.max(0, parseInt($('#ccAutoApprove').value, 10) || 0);
                         config.Threads = Math.max(0, parseInt($('#ccThreads').value, 10) || 0);
                         config.VaapiDevice = $('#ccVaapi').value.trim();
                         return ApiClient.updatePluginConfiguration(pluginId, config);

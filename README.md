@@ -11,11 +11,16 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 - **Warteschlange:** immer ein Job gleichzeitig, und nur solange weniger Streams aktiv sind als die Stream-Grenze
   (Standard 2, also höchstens ein laufender Stream). Wird die Grenze erreicht, hält der laufende Job an und
   macht später an derselben Stelle weiter.
-- **Original:** bleibt an seinem Platz, bis die neue Datei fertig und geprüft ist (Codec, Laufzeit, Anzahl der
-  Ton- und Untertitelspuren). Danach wandert es in den Sicherungsordner und wird dort nach 14 Tagen gelöscht (einstellbar).
-- **Namen:** Ordner und Dateiname bleiben gleich, das Jellyfin-Namensschema bleibt also erhalten. Die Dateiendung
-  ändert sich nur, wenn der alte Container den Zielcodec nicht aufnehmen kann (z. B. `.avi` → `.mkv`).
-- **Unverändert übernommen:** alle Tonspuren, Untertitel, Kapitel und Metadaten.
+- **Ablage:** Die neue Datei wird neben das Original gelegt und trägt den neuen Codec im Namen. Steht der alte
+  Codec im Dateinamen, wird er ersetzt (`Film (2020) - 1080p x264.mkv` → `Film (2020) - 1080p x265.mkv`), sonst
+  wird er als Versionsname angehängt (`Film (2020).mkv` → `Film (2020) - HEVC.mkv`). In Jellyfin erscheinen beide
+  als auswählbare Versionen.
+- **Freigabe:** Erst mit „Freigeben“ wird das Original gelöscht, mit „Verwerfen“ die neue Datei. Ohne Entscheidung
+  wird nach 14 Tagen automatisch freigegeben (einstellbar, 0 = nie).
+- **Geprüft:** Vor dem Ablegen und noch einmal vor dem Löschen des Originals wird die neue Datei geprüft (Codec,
+  Laufzeit, Anzahl der Ton- und Untertitelspuren).
+- **Unverändert übernommen:** alle Tonspuren, Untertitel, Kapitel und Metadaten. Externe Untertiteldateien werden
+  für die neue Datei mitkopiert, der Gesehen-Status wird bei der Freigabe übertragen.
 
 ## Installieren
 
@@ -25,11 +30,11 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 Danach „Codec Converter“ im Katalog installieren und Jellyfin neu starten.
 
-**Von Hand:** `codec-converter_1.0.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
+**Von Hand:** `codec-converter_1.1.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
 
-    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.0.0.0
-    sudo unzip codec-converter_1.0.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.0.0.0
-    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.0.0.0
+    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.1.0.0
+    sudo unzip codec-converter_1.1.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.1.0.0
+    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.1.0.0
     sudo systemctl restart jellyfin
 
 Danach: Dashboard → Codec Converter. Auf dem Server wird nichts zusätzlich installiert, das Plugin benutzt
@@ -45,29 +50,33 @@ das ffmpeg, das Jellyfin selbst verwendet.
       sudo setfacl -R -m u:jellyfin:rwX /pfad/zur/Bibliothek
       sudo setfacl -R -d -m u:jellyfin:rwX /pfad/zur/Bibliothek
 
-- **Freier Speicher:** im Medienordner etwa die Größe der neuen Datei; liegt der Sicherungsordner auf einem anderen
-  Datenträger, dort die Größe des Originals plus 2 GB Reserve. Das Plugin prüft beides vor jedem Job.
-- Der **Sicherungsordner** liegt standardmäßig im Jellyfin-Datenordner (`…/data/codec-converter/backup`), also meist
-  auf der Systemplatte. Für große Bibliotheken besser einen Ordner auf der Medienplatte einstellen – aber außerhalb
-  der Bibliotheken, sonst nimmt Jellyfin die Originale als Duplikate auf.
+- **Freier Speicher im Medienordner:** Original und neue Datei liegen bis zur Freigabe nebeneinander. Das Plugin
+  prüft vor jedem Job, ob die geschätzte neue Datei Platz hat.
 - **Hardware-Encoder** brauchen zusätzlich GPU, Treiber und Gerätezugriff für den Benutzer `jellyfin` (ungetestet).
 
 ## Gut zu wissen
 
-- Nach einem fertigen Job dauert es etwa eine Minute, bis Jellyfin die neue Datei eingelesen hat. Solange ist sie
-  in der Auswahl gesperrt.
+- Nach einem fertigen Job dauert es etwa eine Minute, bis Jellyfin die neue Datei als Version anzeigt.
+- Bei Filmen erkennt Jellyfin Versionen nur, wenn der Dateiname mit dem Ordnernamen beginnt und der Zusatz mit
+  ` - `, Punkt, Unterstrich oder Klammern abgetrennt ist. Sonst (z. B. `Film.2003.1080p.x264-GRP.mkv`) erscheinen
+  Original und neue Datei bis zur Freigabe als zwei getrennte Filme. Bei Folgen klappt es mit jeder Schreibweise.
+- Welche Version Jellyfin zuerst abspielt, bestimmt Jellyfin (alphabetisch bzw. nach Auflösung). Zum Prüfen die
+  neue Version im Player auswählen.
+- Wird die Datei gerade abgespielt, lassen sich Freigeben und Verwerfen nicht ausführen.
+- Originale, die Version 1.0 in den Sicherungsordner verschoben hat, werden dort weiterhin nach Fristablauf gelöscht.
 - Die Größenschätzung ist grob. Sie rechnet aus Auflösung, Bildrate, Laufzeit, Quellbitrate und Qualitätswert und
   kann je nach Bildinhalt (Filmkorn, viel Bewegung) deutlich danebenliegen.
+- Mit NVENC laufen Dekodieren und Kodieren auf der Grafikkarte. Kann die Karte eine Quelle nicht dekodieren,
+  folgt automatisch ein zweiter Versuch, bei dem die CPU dekodiert.
 - Hardware-Encoder werden angeboten, sobald Jellyfins ffmpeg sie enthält – das heißt nicht, dass die passende
   GPU vorhanden ist. Ohne GPU schlägt der Job fehl, das Original bleibt unangetastet.
 - Dolby-Vision-Dateien werden nicht umgewandelt (die Dolby-Vision-Daten gingen verloren). HDR10 bleibt mit
   dem CPU-Encoder x265 erhalten.
 - Eingebettete Cover-Bilder in MP4-Dateien werden nicht übernommen.
-- Wird genau die umgewandelte Datei gerade abgespielt, wartet der Austausch, bis die Wiedergabe endet.
 - Meldet ffmpeg 60 Minuten lang keinen Fortschritt, wird der Job abgebrochen; das Original bleibt erhalten.
 - Unter Windows kann ein laufender Job nicht angehalten werden; er läuft zu Ende, neue Jobs warten.
 - Ein Neustart oder Absturz des Servers ist unkritisch: unterbrochene Jobs beginnen danach von vorn, halbfertige
-  Dateien werden entfernt.
+  Dateien werden entfernt, wartende Freigaben bleiben erhalten.
 
 ## Bauen
 

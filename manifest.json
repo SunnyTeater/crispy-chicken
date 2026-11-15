@@ -8,6 +8,14 @@
     "category": "General",
     "versions": [
       {
+        "version": "1.1.0.0",
+        "changelog": "Neue Ablage: die umgewandelte Datei liegt mit dem neuen Codec im Namen neben dem Original und ist in Jellyfin als Version auswählbar. Freigeben löscht das Original, Verwerfen die neue Datei, automatische Freigabe nach Frist. NVENC dekodiert jetzt auf der Grafikkarte. Erläuterungen zu Qualitätswert und Geschwindigkeit.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/SunnyTeater/crispy-chicken/releases/download/v1.1.0.0/codec-converter_1.1.0.0.zip",
+        "checksum": "9d42358f7625d02c9cba1d145ba0274f",
+        "timestamp": "2026-11-15T02:40:00Z"
+      },
+      {
         "version": "1.0.0.0",
         "changelog": "Erste Version",
         "targetAbi": "12.0.0.0",

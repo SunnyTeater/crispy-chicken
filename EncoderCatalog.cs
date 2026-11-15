@@ -63,6 +63,11 @@ public static class EncoderCatalog
     // Hardware-Encoder brauchen fuer dieselbe Qualitaet spuerbar mehr Bitrate als die CPU-Encoder.
     private const double HardwarePenalty = 1.35;
 
+    // Codec-Angaben, wie sie in Dateinamen stehen: x264, h.265, HEVC, AVC, XviD ... - nur als eigenes Wort.
+    private static readonly Regex _codecTag = new(
+        @"(?<![A-Za-z0-9])(x\.?26[45]|h\.?26[45]|avc|hevc|av1|xvid|divx|mpeg-?[24]|vc-?1|vp9)(?![A-Za-z0-9])",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     private static readonly Regex _vaapiDevice = new("^/dev/dri/renderD[0-9]{1,4}$", RegexOptions.CultureInvariant);
 
     /// <summary>
@@ -230,6 +235,40 @@ public static class EncoderCatalog
     }
 
     /// <summary>
+    /// Bildet den Dateinamen (ohne Endung) der neuen Datei. Steht der alte Codec im Namen, wird er ersetzt
+    /// ("Film x264" wird "Film x265"); sonst wird der neue Codec als Versionsname angehaengt ("Film - HEVC").
+    /// Der Name unterscheidet sich immer vom Original, damit beide Dateien nebeneinander liegen koennen.
+    /// </summary>
+    /// <param name="baseName">Dateiname des Originals ohne Endung.</param>
+    /// <param name="targetCodec">Der Zielcodec.</param>
+    /// <returns>Der neue Dateiname ohne Endung.</returns>
+    public static string BuildTargetName(string baseName, string targetCodec)
+    {
+        var label = targetCodec switch
+        {
+            "hevc" => "HEVC",
+            "av1" => "AV1",
+            _ => "H264"
+        };
+
+        var replaced = _codecTag.Replace(baseName, match => ReplaceTag(match.Value, targetCodec, label));
+        return string.Equals(replaced, baseName, StringComparison.Ordinal) ? baseName + " - " + label : replaced;
+    }
+
+    private static string ReplaceTag(string tag, string targetCodec, string label)
+    {
+        var first = char.ToLowerInvariant(tag[0]);
+        var numbered = (first == 'x' || first == 'h') && (tag.EndsWith("264", StringComparison.Ordinal) || tag.EndsWith("265", StringComparison.Ordinal));
+        if (!numbered || targetCodec == "av1")
+        {
+            return label;
+        }
+
+        // Schreibweise des Originals behalten: x264 -> x265, H.264 -> H.265.
+        return tag[0] + (tag.Contains('.', StringComparison.Ordinal) ? "." : string.Empty) + (targetCodec == "hevc" ? "265" : "264");
+    }
+
+    /// <summary>
     /// Bitratenbedarf eines Codecs fuer gleiche Qualitaet, relativ zu H.264.
     /// </summary>
     private static double Efficiency(string codec) => codec switch
@@ -279,8 +318,9 @@ public static class EncoderCatalog
     /// <param name="format">Das ffmpeg-Format der Zieldatei.</param>
     /// <param name="threads">Threads (0 = automatisch).</param>
     /// <param name="vaapiDevice">Das VAAPI-Geraet.</param>
+    /// <param name="gpuDecode">Ob (bei NVENC) auch das Dekodieren der Quelle auf der GPU laufen soll.</param>
     /// <returns>Die Argumentliste.</returns>
-    public static List<string> BuildArguments(Job job, string format, int threads, string vaapiDevice)
+    public static List<string> BuildArguments(Job job, string format, int threads, string vaapiDevice, bool gpuDecode)
     {
         // Kein "-y": ffmpeg soll eine vorhandene Datei nie ueberschreiben.
         var args = new List<string> { "-hide_banner", "-nostdin", "-n", "-loglevel", "error", "-nostats" };
@@ -294,6 +334,13 @@ public static class EncoderCatalog
             }
 
             args.AddRange(new[] { "-vaapi_device", vaapiDevice });
+        }
+
+        if (gpuDecode && UsesGpuDecode(job.Encoder))
+        {
+            // Ohne diese Optionen dekodiert ffmpeg die Quelle auf der CPU und nur das Kodieren laeuft auf der GPU:
+            // die CPU ist dann trotz NVENC voll ausgelastet. So bleiben die Bilder durchgehend im Grafikspeicher.
+            args.AddRange(new[] { "-hwaccel", "cuda", "-hwaccel_output_format", "cuda" });
         }
 
         // Die Quelle darf nur lokale Dateien lesen: eine praeparierte Mediendatei (etwa eine als Video
@@ -338,6 +385,13 @@ public static class EncoderCatalog
         args.AddRange(new[] { "-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-f", format, "file:" + job.TempPath });
         return args;
     }
+
+    /// <summary>
+    /// Ob fuer einen Encoder zusaetzlich das Dekodieren auf der GPU versucht wird.
+    /// </summary>
+    /// <param name="encoder">Name des Encoders.</param>
+    /// <returns>True bei den NVENC-Encodern.</returns>
+    public static bool UsesGpuDecode(string encoder) => encoder.EndsWith("_nvenc", StringComparison.Ordinal);
 
     private static IEnumerable<string> QualityArguments(Job job)
     {

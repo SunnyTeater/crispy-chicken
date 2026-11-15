@@ -1,6 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Jellyfin.Plugin.CodecConverter.Services;
 using MediaBrowser.Common.Api;
 using Microsoft.AspNetCore.Authorization;
@@ -52,13 +55,10 @@ public class CodecConverterController : ControllerBase
             Encoders = t.Encoders.Select(e => new { e.Name, e.Label, e.Hardware, Available = _runner.SupportsEncoder(e.Name) })
         });
 
-        var backupRoot = _runner.GetBackupRoot(out var backupError);
         return Ok(new
         {
             Targets = targets,
             EncoderCatalog.Speeds,
-            BackupRoot = backupRoot,
-            BackupError = backupError,
             JobRunner.CanPause
         });
     }
@@ -71,16 +71,21 @@ public class CodecConverterController : ControllerBase
     [HttpGet("Items")]
     public ActionResult GetItems([FromQuery] bool refresh = false)
     {
-        var open = _store.OpenItemIds();
-        var recent = _store.RecentlyConverted();
+        var open = _store.OpenItemStates();
         var entries = _index.GetEntries(refresh).Select(e =>
         {
             // Der Zwischenspeicher wird geteilt, deshalb den Warteschlangen-Status nur in der Antwort setzen.
             var copy = (MediaEntry)CloneEntry(e);
-            copy.Queued = open.Contains(e.Id);
-            if (copy.Blocked is null && recent.TryGetValue(e.Id, out var oldSize) && oldSize == e.Size)
+            if (open.TryGetValue(e.Id, out var state))
             {
-                copy.Blocked = JobRunner.PendingRefreshText;
+                if (state == JobState.AwaitingApproval)
+                {
+                    copy.Blocked ??= JobRunner.AwaitingApprovalText;
+                }
+                else
+                {
+                    copy.Queued = true;
+                }
             }
 
             return copy;
@@ -130,11 +135,6 @@ public class CodecConverterController : ControllerBase
             error = "Jellyfins ffmpeg kennt den Encoder " + encoder.Name + " nicht.";
         }
 
-        if (error is null && _runner.GetBackupRoot(out var backupError) is null)
-        {
-            error = backupError;
-        }
-
         if (error is not null)
         {
             return BadRequest(new { Message = error });
@@ -171,7 +171,14 @@ public class CodecConverterController : ControllerBase
                 j.ResultSize,
                 j.Message,
                 j.Created,
-                j.Finished
+                j.Finished,
+                SourceName = Path.GetFileName(j.SourcePath),
+                TargetName = Path.GetFileName(j.TargetPath),
+
+                // Zeitpunkt der automatischen Freigabe, falls eine Frist gesetzt ist.
+                AutoApproveAt = j.State == JobState.AwaitingApproval && j.Converted.HasValue && _runner.AutoApproveDays > 0
+                    ? j.Converted.Value.AddDays(_runner.AutoApproveDays)
+                    : (DateTime?)null
             })
         });
     }
@@ -189,13 +196,52 @@ public class CodecConverterController : ControllerBase
     }
 
     /// <summary>
+    /// Gibt eine umgewandelte Datei frei: das Original wird geloescht.
+    /// </summary>
+    /// <param name="id">Die Job-Id.</param>
+    /// <param name="cancellationToken">Abbruch-Token.</param>
+    /// <returns>Ergebnis.</returns>
+    [HttpPost("Jobs/{id}/Approve")]
+    public async Task<ActionResult> Approve([FromRoute] string id, CancellationToken cancellationToken)
+    {
+        var error = await _runner.ApproveAsync(id, false, cancellationToken).ConfigureAwait(false);
+        return error is null ? NoContent() : BadRequest(new { Message = error });
+    }
+
+    /// <summary>
+    /// Verwirft eine umgewandelte Datei: die neue Datei wird geloescht, das Original bleibt.
+    /// </summary>
+    /// <param name="id">Die Job-Id.</param>
+    /// <param name="cancellationToken">Abbruch-Token.</param>
+    /// <returns>Ergebnis.</returns>
+    [HttpPost("Jobs/{id}/Reject")]
+    public async Task<ActionResult> Reject([FromRoute] string id, CancellationToken cancellationToken)
+    {
+        var error = await _runner.RejectAsync(id, cancellationToken).ConfigureAwait(false);
+        return error is null ? NoContent() : BadRequest(new { Message = error });
+    }
+
+    /// <summary>
+    /// Gibt alle wartenden Jobs frei.
+    /// </summary>
+    /// <param name="cancellationToken">Abbruch-Token.</param>
+    /// <returns>Anzahl und Fehler.</returns>
+    [HttpPost("Jobs/ApproveAll")]
+    public async Task<ActionResult> ApproveAll(CancellationToken cancellationToken)
+    {
+        var (approved, errors) = await _runner.ApproveAllAsync(cancellationToken).ConfigureAwait(false);
+        return Ok(new { Approved = approved, Errors = errors });
+    }
+
+    /// <summary>
     /// Entfernt alle abgeschlossenen Jobs aus der Liste.
     /// </summary>
     /// <returns>Anzahl der entfernten Jobs.</returns>
     [HttpPost("Jobs/ClearFinished")]
     public ActionResult ClearFinished()
     {
-        return Ok(new { Removed = _store.Remove(j => !JobStore.IsOpen(j)) });
+        // Jobs, deren Gesehen-Status noch auf die neue Datei zu uebertragen ist, bleiben bis dahin stehen.
+        return Ok(new { Removed = _store.Remove(j => !JobStore.IsOpen(j) && j.PendingUserStates.Count == 0) });
     }
 
     private static object CloneEntry(MediaEntry e) => new MediaEntry

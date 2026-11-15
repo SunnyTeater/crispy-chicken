@@ -8,7 +8,7 @@ namespace Jellyfin.Plugin.CodecConverter.Configuration;
 public class PluginConfiguration : BasePluginConfiguration
 {
     /// <summary>
-    /// Gets or sets den Sicherungsordner fuer Originale. Leer = Standardordner im Jellyfin-Datenordner.
+    /// Gets or sets den Sicherungsordner aus Version 1.0. Wird nur noch gebraucht, um dort liegende Originale nach Fristablauf zu loeschen.
     /// </summary>
     public string BackupPath { get; set; } = string.Empty;
 
@@ -16,6 +16,12 @@ public class PluginConfiguration : BasePluginConfiguration
     /// Gets or sets die Aufbewahrung der Originale in Tagen. 0 = nie automatisch loeschen.
     /// </summary>
     public int BackupRetentionDays { get; set; } = 14;
+
+    /// <summary>
+    /// Gets or sets die Frist in Tagen, nach der eine umgewandelte Datei automatisch freigegeben
+    /// und das Original geloescht wird. 0 = nie automatisch.
+    /// </summary>
+    public int AutoApproveDays { get; set; } = 14;
 
     /// <summary>
     /// Gets or sets die Stream-Grenze: Jobs laufen nur, solange weniger Streams aktiv sind.

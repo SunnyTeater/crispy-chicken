@@ -36,10 +36,15 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// <summary>
     /// Hinweis fuer Dateien, die schon umgewandelt sind, in Jellyfins Bibliothek aber noch mit den alten Daten stehen.
     /// </summary>
-    public const string PendingRefreshText = "Gerade umgewandelt, Jellyfin liest die Datei noch neu ein";
+    public const string AwaitingApprovalText = "Umgewandelt, wartet auf Freigabe";
 
     private const string TempExtension = ".ccpart";
-    private const long BackupReserveBytes = 2L * 1024 * 1024 * 1024;
+
+    private static readonly HashSet<string> _sidecarExtensions = new(StringComparer.Ordinal)
+    {
+        ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".smi"
+    };
+
     private static readonly TimeSpan StallTimeout = TimeSpan.FromMinutes(60);
     private const string BackupMarker = ".codec-converter-backup";
 
@@ -48,11 +53,16 @@ public sealed class JobRunner : IHostedService, IDisposable
     private readonly ILibraryManager _libraryManager;
     private readonly ILibraryMonitor _libraryMonitor;
     private readonly ISessionManager _sessionManager;
+    private readonly IUserManager _userManager;
+    private readonly IUserDataManager _userDataManager;
     private readonly IMediaEncoder _mediaEncoder;
     private readonly ILogger<JobRunner> _logger;
     private readonly CancellationTokenSource _stopping = new();
     private readonly object _lock = new();
     private readonly object _planLock = new();
+    private readonly SemaphoreSlim _approvalLock = new(1, 1);
+    private DateTime _lastAutoApprove = DateTime.MinValue;
+    private DateTime _lastUserStateRun = DateTime.MinValue;
     private DateTime _lastOutput = DateTime.UtcNow;
     private Task? _loop;
     private Process? _process;
@@ -69,6 +79,8 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// <param name="libraryManager">Der Bibliotheksmanager.</param>
     /// <param name="libraryMonitor">Der Bibliotheksmonitor.</param>
     /// <param name="sessionManager">Der Sitzungsmanager.</param>
+    /// <param name="userManager">Die Benutzerverwaltung.</param>
+    /// <param name="userDataManager">Die Benutzerdaten (Gesehen-Status, Fortschritt).</param>
     /// <param name="mediaEncoder">Jellyfins ffmpeg-Zugang.</param>
     /// <param name="logger">Der Logger.</param>
     public JobRunner(
@@ -77,6 +89,8 @@ public sealed class JobRunner : IHostedService, IDisposable
         ILibraryManager libraryManager,
         ILibraryMonitor libraryMonitor,
         ISessionManager sessionManager,
+        IUserManager userManager,
+        IUserDataManager userDataManager,
         IMediaEncoder mediaEncoder,
         ILogger<JobRunner> logger)
     {
@@ -85,6 +99,8 @@ public sealed class JobRunner : IHostedService, IDisposable
         _libraryManager = libraryManager;
         _libraryMonitor = libraryMonitor;
         _sessionManager = sessionManager;
+        _userManager = userManager;
+        _userDataManager = userDataManager;
         _mediaEncoder = mediaEncoder;
         _logger = logger;
     }
@@ -98,6 +114,11 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// Gets die Stream-Grenze: Jobs laufen nur, solange weniger Streams aktiv sind.
     /// </summary>
     public int StreamLimit => Math.Clamp(Config.StreamLimit, 1, 1000);
+
+    /// <summary>
+    /// Gets die Frist der automatischen Freigabe in Tagen (0 = nie).
+    /// </summary>
+    public int AutoApproveDays => Math.Clamp(Config.AutoApproveDays, 0, 3650);
 
     /// <summary>
     /// Gets a value indicating whether gerade zu viele Streams laufen.
@@ -195,8 +216,7 @@ public sealed class JobRunner : IHostedService, IDisposable
     {
         var skipped = new List<string>();
         var jobs = new List<Job>();
-        var open = _store.OpenItemIds();
-        var recent = _store.RecentlyConverted();
+        var open = _store.OpenItemStates();
         var room = JobStore.MaxJobs - _store.Count;
 
         foreach (var id in request.ItemIds.Distinct())
@@ -209,22 +229,18 @@ public sealed class JobRunner : IHostedService, IDisposable
             }
 
             string? reason = entry.Blocked;
-            if (reason is null && open.Contains(id))
+            if (reason is null && open.TryGetValue(id, out var openState))
             {
-                reason = "bereits in der Warteschlange";
+                reason = openState == JobState.AwaitingApproval ? AwaitingApprovalText : "bereits in der Warteschlange";
             }
 
-            if (reason is null && recent.TryGetValue(id, out var oldSize) && oldSize == entry.Size)
-            {
-                reason = PendingRefreshText;
-            }
-
+            // Die neue Datei kommt neben das Original und traegt den neuen Codec im Namen.
             var container = EncoderCatalog.GetContainer(path, target.Codec);
             var directory = Path.GetDirectoryName(path)!;
             var baseName = Path.GetFileNameWithoutExtension(path);
-            var targetPath = Path.Combine(directory, baseName + container.Extension);
+            var targetPath = Path.Combine(directory, EncoderCatalog.BuildTargetName(baseName, target.Codec) + container.Extension);
 
-            if (reason is null && !string.Equals(targetPath, path, StringComparison.Ordinal) && File.Exists(targetPath))
+            if (reason is null && (File.Exists(targetPath) || jobs.Any(j => string.Equals(j.TargetPath, targetPath, StringComparison.Ordinal))))
             {
                 reason = "Zieldatei " + Path.GetFileName(targetPath) + " existiert bereits";
             }
@@ -262,7 +278,7 @@ public sealed class JobRunner : IHostedService, IDisposable
                 State = JobState.Queued,
                 Created = DateTime.UtcNow.AddTicks(jobs.Count)
             });
-            open.Add(id);
+            open[id] = JobState.Queued;
         }
 
         if (jobs.Count > 0)
@@ -306,7 +322,14 @@ public sealed class JobRunner : IHostedService, IDisposable
                     return null;
                 case JobState.Finalizing:
                     return "Der Job wird gerade abgeschlossen und kann nicht mehr abgebrochen werden.";
+                case JobState.AwaitingApproval:
+                    return "Dieser Job wartet auf Freigabe: bitte freigeben oder verwerfen.";
                 default:
+                    if (job.PendingUserStates.Count > 0)
+                    {
+                        return "Der Gesehen-Status wird noch auf die neue Datei übertragen. Bitte in ein bis zwei Minuten erneut entfernen.";
+                    }
+
                     _store.Remove(j => string.Equals(j.Id, id, StringComparison.Ordinal));
                     return null;
             }
@@ -346,6 +369,7 @@ public sealed class JobRunner : IHostedService, IDisposable
     {
         KillProcess();
         _stopping.Dispose();
+        _approvalLock.Dispose();
     }
 
     private static string DisplayName(MediaEntry entry)
@@ -382,6 +406,8 @@ public sealed class JobRunner : IHostedService, IDisposable
             try
             {
                 CleanupBackups();
+                await AutoApproveAsync(token).ConfigureAwait(false);
+                RestoreUserStates();
 
                 var job = _store.NextQueued();
                 if (job is not null && string.IsNullOrEmpty(_mediaEncoder.EncoderPath))
@@ -446,11 +472,6 @@ public sealed class JobRunner : IHostedService, IDisposable
             return entry.Blocked;
         }
 
-        if (_store.RecentlyConverted().TryGetValue(job.ItemId, out var oldSize) && oldSize == entry.Size)
-        {
-            return "Die Datei wurde gerade erst umgewandelt.";
-        }
-
         var source = new FileInfo(job.SourcePath);
         if (!source.Exists)
         {
@@ -462,46 +483,18 @@ public sealed class JobRunner : IHostedService, IDisposable
             return "Die Quelldatei ist ein Symlink. Symlinks werden nicht umgewandelt.";
         }
 
-        if (!string.Equals(job.TargetPath, job.SourcePath, StringComparison.Ordinal) && File.Exists(job.TargetPath))
+        if (File.Exists(job.TargetPath))
         {
             return "Die Zieldatei " + Path.GetFileName(job.TargetPath) + " existiert bereits.";
         }
 
-        var backupRoot = GetBackupRoot(out var backupError);
-        if (backupRoot is null)
-        {
-            return backupError;
-        }
-
         try
         {
-            // Jetzt pruefen statt erst nach Stunden des Umwandelns.
-            Directory.CreateDirectory(backupRoot);
-            var probe = Path.Combine(backupRoot, ".schreibtest-" + job.Id[..8]);
-            File.WriteAllText(probe, string.Empty);
-            File.Delete(probe);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return "Der Sicherungsordner " + backupRoot + " ist für den Jellyfin-Dienst nicht beschreibbar.";
-        }
-
-        try
-        {
-            var media = new DriveInfo(source.DirectoryName!);
+            // Original und neue Datei liegen bis zur Freigabe nebeneinander.
             var needed = (long)(Math.Max(job.EstimatedSize, 0) * 1.1) + (64L * 1024 * 1024);
-            if (media.AvailableFreeSpace < needed)
+            if (new DriveInfo(source.DirectoryName!).AvailableFreeSpace < needed)
             {
                 return "Zu wenig freier Speicher im Medienordner.";
-            }
-
-            // Liegt der Sicherungsordner auf einem anderen Datentraeger, wird das Original dorthin kopiert.
-            // Ein voller Datentraeger (oft die Systemplatte) wuerde den ganzen Server lahmlegen.
-            var backup = new DriveInfo(backupRoot);
-            var sameVolume = backup.TotalSize == media.TotalSize && Math.Abs(backup.AvailableFreeSpace - media.AvailableFreeSpace) < 16L * 1024 * 1024;
-            if (!sameVolume && backup.AvailableFreeSpace < source.Length + BackupReserveBytes)
-            {
-                return "Zu wenig freier Speicher im Sicherungsordner " + backupRoot + " (das Original und 2 GB Reserve müssen hineinpassen).";
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
@@ -536,10 +529,11 @@ public sealed class JobRunner : IHostedService, IDisposable
             }
 
             var (_, format) = EncoderCatalog.GetContainer(job.SourcePath, job.TargetCodec);
+            var gpuDecode = EncoderCatalog.UsesGpuDecode(job.Encoder);
             List<string> arguments;
             try
             {
-                arguments = EncoderCatalog.BuildArguments(job, format, Math.Clamp(Config.Threads, 0, 256), Config.VaapiDevice ?? string.Empty);
+                arguments = EncoderCatalog.BuildArguments(job, format, Math.Clamp(Config.Threads, 0, 256), Config.VaapiDevice ?? string.Empty, gpuDecode);
             }
             catch (InvalidOperationException ex)
             {
@@ -566,6 +560,17 @@ public sealed class JobRunner : IHostedService, IDisposable
             _logger.LogInformation("Codec Converter: starte {Name} ({Source} -> {Target}, {Encoder}, Qualität {Quality})", job.Name, job.SourceCodec, job.TargetCodec, job.Encoder, job.Quality);
 
             var (exitCode, errorText, cancelled) = await RunFfmpegAsync(job, arguments, token).ConfigureAwait(false);
+
+            if (gpuDecode && exitCode != 0 && !cancelled && !token.IsCancellationRequested)
+            {
+                // Nicht jede Grafikkarte kann jede Quelle dekodieren (alte Codecs, 10 Bit ...): zweiter Versuch,
+                // bei dem die CPU dekodiert und nur das Kodieren auf der GPU laeuft.
+                _logger.LogInformation("Codec Converter: {Name}: Dekodieren auf der GPU fehlgeschlagen ({Error}), zweiter Versuch mit CPU-Dekodierung", job.Name, errorText);
+                DeleteIfExists(job.TempPath);
+                _store.Update(job, j => j.Progress = 0);
+                arguments = EncoderCatalog.BuildArguments(job, format, Math.Clamp(Config.Threads, 0, 256), Config.VaapiDevice ?? string.Empty, false);
+                (exitCode, errorText, cancelled) = await RunFfmpegAsync(job, arguments, token).ConfigureAwait(false);
+            }
 
             if (token.IsCancellationRequested)
             {
@@ -856,9 +861,9 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// <summary>
     /// Vergleicht die neue Datei mit dem Original. Liefert einen Fehlertext oder null.
     /// </summary>
-    private async Task<string?> VerifyAsync(Job job, CancellationToken token)
+    private async Task<string?> VerifyAsync(Job job, string path, CancellationToken token)
     {
-        var temp = new FileInfo(job.TempPath);
+        var temp = new FileInfo(path);
         if (!temp.Exists || temp.Length < 1024)
         {
             return "ffmpeg hat keine verwertbare Datei erzeugt.";
@@ -866,10 +871,10 @@ public sealed class JobRunner : IHostedService, IDisposable
 
         if (temp.LinkTarget is not null)
         {
-            return "Die temporäre Datei ist ein Symlink.";
+            return "Die Datei ist ein Symlink.";
         }
 
-        var result = await ProbeAsync(job.TempPath, token).ConfigureAwait(false);
+        var result = await ProbeAsync(path, token).ConfigureAwait(false);
         var video = result?.MediaStreams?.FirstOrDefault(s => s.Type == MediaStreamType.Video);
         if (result is null || video is null)
         {
@@ -913,7 +918,12 @@ public sealed class JobRunner : IHostedService, IDisposable
             j.Progress = 1;
         });
 
-        var problem = await VerifyAsync(job, token).ConfigureAwait(false);
+        var problem = await VerifyAsync(job, job.TempPath, token).ConfigureAwait(false);
+        if (problem is null && File.Exists(job.TargetPath))
+        {
+            problem = "Die Zieldatei " + Path.GetFileName(job.TargetPath) + " existiert inzwischen.";
+        }
+
         if (problem is not null)
         {
             DeleteIfExists(job.TempPath);
@@ -921,124 +931,400 @@ public sealed class JobRunner : IHostedService, IDisposable
             return;
         }
 
-        var root = GetBackupRoot(out var backupError);
-        if (root is null)
-        {
-            DeleteIfExists(job.TempPath);
-            Fail(job, backupError + " Das Original wurde nicht angetastet.");
-            return;
-        }
-
-        // Wird genau diese Datei gerade abgespielt, bliebe die Wiedergabe beim Austausch haengen: warten, bis sie endet.
-        var waiting = false;
-        while (IsBeingPlayed(job))
-        {
-            if (!waiting)
-            {
-                waiting = true;
-                _store.Update(job, j => j.Message = "Fertig umgewandelt. Wartet mit dem Austausch, bis die Wiedergabe dieser Datei endet.");
-                _logger.LogInformation("Codec Converter: {Name} wird gerade abgespielt, Austausch wartet", job.Name);
-            }
-
-            try
-            {
-                await Task.Delay(TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                // Server faehrt herunter: nichts halb Fertiges zuruecklassen, der Job laeuft spaeter erneut.
-                DeleteIfExists(job.TempPath);
-                _store.Update(job, j =>
-                {
-                    j.State = JobState.Queued;
-                    j.Progress = 0;
-                    j.Message = null;
-                });
-                return;
-            }
-        }
-
-        var backupDirectory = Path.Combine(root, DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "_" + job.Id[..8]);
-        var backupFile = Path.Combine(backupDirectory, Path.GetFileName(job.SourcePath));
-        var originalMoved = false;
-
         try
         {
-            if (OperatingSystem.IsWindows())
-            {
-                Directory.CreateDirectory(backupDirectory);
-            }
-            else
-            {
-                // Nur der Jellyfin-Dienst darf an die gesicherten Originale, auch wenn der Sicherungsordner selbst offener ist.
-                Directory.CreateDirectory(backupDirectory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-            }
-
-            File.WriteAllText(Path.Combine(backupDirectory, BackupMarker), "Original von: " + job.SourcePath + Environment.NewLine);
-
             if (!OperatingSystem.IsWindows())
             {
                 // Die neue Datei bekommt dieselben Zugriffsrechte wie das Original.
                 File.SetUnixFileMode(job.TempPath, File.GetUnixFileMode(job.SourcePath));
             }
 
-            // Vor dem Verschieben vermerken, wohin das Original geht: nach einem Absturz laesst sich der Stand rekonstruieren.
-            _store.Update(job, j => j.BackupFile = backupFile);
-
-            File.Move(job.SourcePath, backupFile, false);
-            originalMoved = true;
-
+            // Das Original bleibt, wo es ist. Die neue Datei erscheint unter ihrem endgueltigen Namen daneben.
             File.Move(job.TempPath, job.TargetPath, false);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            Fail(job, RollBack(job, backupFile, backupDirectory, originalMoved, ex));
+            DeleteIfExists(job.TempPath);
+            Fail(job, "Abschluss fehlgeschlagen: " + ex.Message + " Das Original wurde nicht angetastet.");
             return;
         }
 
+        var sidecars = CopySidecars(job);
         var size = new FileInfo(job.TargetPath).Length;
         _store.Update(job, j =>
         {
-            j.State = JobState.Done;
+            j.State = JobState.AwaitingApproval;
             j.ResultSize = size;
             j.Finished = DateTime.UtcNow;
-            j.Message = "Original gesichert unter " + backupFile;
+            j.Converted = DateTime.UtcNow;
+            j.Sidecars = sidecars;
+            j.Message = "Neue Datei: " + Path.GetFileName(j.TargetPath) + ". Das Original bleibt bis zur Freigabe erhalten.";
         });
-        _logger.LogInformation("Codec Converter: {Name} fertig, {Before} -> {After} Bytes", job.Name, job.SourceSize, size);
+        _logger.LogInformation("Codec Converter: {Name} umgewandelt, {Before} -> {After} Bytes, wartet auf Freigabe", job.Name, job.SourceSize, size);
 
         RefreshLibrary(job);
     }
 
     /// <summary>
-    /// Stellt nach einem Fehler beim Abschluss den Ausgangszustand wieder her.
+    /// Kopiert externe Untertitel des Originals unter dem Namen der neuen Datei, damit Jellyfin sie auch dort findet.
     /// </summary>
-    private string RollBack(Job job, string backupFile, string backupDirectory, bool originalMoved, Exception cause)
+    private List<SidecarCopy> CopySidecars(Job job)
     {
+        var result = new List<SidecarCopy>();
         try
         {
-            if (originalMoved)
-            {
-                File.Move(backupFile, job.SourcePath, false);
-            }
-            else if (File.Exists(job.SourcePath))
-            {
-                // Abgebrochene Kopie auf einen anderen Datentraeger.
-                DeleteIfExists(backupFile);
-            }
+            var directory = Path.GetDirectoryName(job.SourcePath)!;
+            var oldPrefix = Path.GetFileNameWithoutExtension(job.SourcePath) + ".";
+            var newBase = Path.GetFileNameWithoutExtension(job.TargetPath);
 
-            DeleteIfExists(job.TempPath);
-            if (Directory.Exists(backupDirectory) && !File.Exists(backupFile))
+            foreach (var file in Directory.EnumerateFiles(directory))
             {
-                Directory.Delete(backupDirectory, true);
-            }
+                var name = Path.GetFileName(file);
+                if (!name.StartsWith(oldPrefix, StringComparison.Ordinal)
+                    || !_sidecarExtensions.Contains(Path.GetExtension(name).ToLowerInvariant())
+                    || new FileInfo(file).LinkTarget is not null)
+                {
+                    continue;
+                }
 
-            _store.Update(job, j => j.BackupFile = null);
-            return "Abschluss fehlgeschlagen: " + cause.Message + " Das Original liegt unverändert an seinem Platz.";
+                var copy = Path.Combine(directory, newBase + "." + name[oldPrefix.Length..]);
+                if (!File.Exists(copy))
+                {
+                    File.Copy(file, copy, false);
+                    result.Add(new SidecarCopy { Original = file, Copy = copy });
+                }
+            }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            _logger.LogError(ex, "Codec Converter: Zurückrollen fehlgeschlagen für {Name}", job.Name);
-            return "Abschluss fehlgeschlagen: " + cause.Message + " Bitte von Hand prüfen. Original: " + (File.Exists(backupFile) ? backupFile : job.SourcePath) + ", neue Datei: " + job.TempPath;
+            // Fehlende Untertitel sind kein Grund, die fertige Umwandlung zu verwerfen.
+            _logger.LogWarning(ex, "Codec Converter: externe Untertitel von {Name} konnten nicht kopiert werden", job.Name);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Gibt eine umgewandelte Datei frei: das Original wird endgueltig geloescht.
+    /// </summary>
+    /// <param name="id">Die Job-Id.</param>
+    /// <param name="automatic">Ob die Freigabe nach Fristablauf automatisch erfolgt.</param>
+    /// <param name="token">Abbruch-Token.</param>
+    /// <returns>Fehlertext oder null.</returns>
+    public async Task<string?> ApproveAsync(string id, bool automatic, CancellationToken token)
+    {
+        await _approvalLock.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            var job = _store.Find(id);
+            if (job is null)
+            {
+                return "Job nicht gefunden.";
+            }
+
+            if (job.State != JobState.AwaitingApproval)
+            {
+                return "Dieser Job wartet nicht auf Freigabe.";
+            }
+
+            if (IsBeingPlayed(job))
+            {
+                return "Die Datei wird gerade abgespielt. Bitte nach der Wiedergabe freigeben.";
+            }
+
+            // Vor dem Loeschen des Originals noch einmal sicherstellen, dass die neue Datei da und abspielbar ist.
+            var target = new FileInfo(job.TargetPath);
+            var problem = !target.Exists
+                ? "Die umgewandelte Datei " + target.Name + " fehlt."
+                : await VerifyAsync(job, job.TargetPath, token).ConfigureAwait(false);
+            if (problem is not null)
+            {
+                return "Freigabe nicht möglich: " + problem + " Das Original bleibt erhalten.";
+            }
+
+            var userStates = CaptureUserStates(job);
+
+            try
+            {
+                var source = new FileInfo(job.SourcePath);
+                if (source.Exists)
+                {
+                    if (source.LinkTarget is not null)
+                    {
+                        return "Das Original ist inzwischen ein Symlink und wird nicht gelöscht.";
+                    }
+
+                    source.Delete();
+                }
+
+                foreach (var sidecar in job.Sidecars)
+                {
+                    DeleteIfExists(sidecar.Original);
+                }
+
+                // Eine NFO-Datei mit dem alten Dateinamen gehoert jetzt zur neuen Datei.
+                var oldNfo = Path.ChangeExtension(job.SourcePath, ".nfo");
+                var newNfo = Path.ChangeExtension(job.TargetPath, ".nfo");
+                if (File.Exists(oldNfo) && !File.Exists(newNfo))
+                {
+                    File.Move(oldNfo, newNfo, false);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return "Das Original konnte nicht gelöscht werden: " + ex.Message;
+            }
+
+            _store.Update(job, j =>
+            {
+                j.State = JobState.Done;
+                j.Finished = DateTime.UtcNow;
+                j.PendingUserStates = userStates;
+                j.Message = (automatic ? "Automatisch freigegeben" : "Freigegeben") + ", Original gelöscht. Neue Datei: " + Path.GetFileName(j.TargetPath);
+            });
+            _logger.LogInformation("Codec Converter: {Name} {Mode} freigegeben, Original {Path} gelöscht", job.Name, automatic ? "automatisch" : "von Hand", job.SourcePath);
+            RefreshLibrary(job);
+            return null;
+        }
+        finally
+        {
+            _approvalLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Merkt sich Gesehen-Status, Fortschritt und Favorit aller Benutzer fuer das Original.
+    /// </summary>
+    private List<UserState> CaptureUserStates(Job job)
+    {
+        var result = new List<UserState>();
+        try
+        {
+            var oldItem = _libraryManager.FindByPath(job.SourcePath, false);
+            if (oldItem is null)
+            {
+                return result;
+            }
+
+            foreach (var user in _userManager.GetUsers())
+            {
+                var data = _userDataManager.GetUserData(user, oldItem);
+                if (data is null || (!data.Played && !data.IsFavorite && data.PlaybackPositionTicks == 0 && data.PlayCount == 0))
+                {
+                    continue;
+                }
+
+                result.Add(new UserState
+                {
+                    UserId = user.Id,
+                    Played = data.Played,
+                    IsFavorite = data.IsFavorite,
+                    PlaybackPositionTicks = data.PlaybackPositionTicks,
+                    PlayCount = data.PlayCount,
+                    LastPlayedDate = data.LastPlayedDate
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            // Der Gesehen-Status ist kein Grund, die Freigabe scheitern zu lassen.
+            _logger.LogWarning(ex, "Codec Converter: Gesehen-Status von {Name} konnte nicht gelesen werden", job.Name);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Uebertraegt den gemerkten Stand auf die neue Datei, sobald Jellyfin das geloeschte Original aus der
+    /// Bibliothek genommen hat. Vorher wuerde Jellyfin den Stand beim Umbau der Versionen wieder verwerfen.
+    /// </summary>
+    private void RestoreUserStates()
+    {
+        if (DateTime.UtcNow - _lastUserStateRun < TimeSpan.FromSeconds(15))
+        {
+            return;
+        }
+
+        _lastUserStateRun = DateTime.UtcNow;
+        foreach (var id in _store.IdsInState(JobState.Done))
+        {
+            var job = _store.Find(id);
+            if (job is null || job.PendingUserStates.Count == 0)
+            {
+                continue;
+            }
+
+            try
+            {
+                if (job.Finished < DateTime.UtcNow.AddDays(-1))
+                {
+                    // Die neue Datei ist nie in der Bibliothek aufgetaucht: aufgeben.
+                    _store.Update(job, j => j.PendingUserStates = new List<UserState>());
+                    continue;
+                }
+
+                var newItem = _libraryManager.FindByPath(job.TargetPath, false);
+                if (newItem is null || _libraryManager.FindByPath(job.SourcePath, false) is not null)
+                {
+                    continue;
+                }
+
+                foreach (var state in job.PendingUserStates)
+                {
+                    var user = _userManager.GetUserById(state.UserId);
+                    if (user is null)
+                    {
+                        continue;
+                    }
+
+                    _userDataManager.SaveUserData(
+                        user,
+                        newItem,
+                        new UpdateUserItemDataDto
+                        {
+                            Played = state.Played,
+                            IsFavorite = state.IsFavorite,
+                            PlaybackPositionTicks = state.PlaybackPositionTicks,
+                            PlayCount = state.PlayCount,
+                            LastPlayedDate = state.LastPlayedDate
+                        },
+                        UserDataSaveReason.Import);
+                }
+
+                _store.Update(job, j => j.PendingUserStates = new List<UserState>());
+                _logger.LogInformation("Codec Converter: Gesehen-Status von {Name} auf die neue Datei übertragen", job.Name);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Codec Converter: Gesehen-Status von {Name} konnte nicht übertragen werden", job.Name);
+                _store.Update(job, j => j.PendingUserStates = new List<UserState>());
+            }
+        }
+    }
+
+    /// <summary>
+    /// Verwirft eine umgewandelte Datei: die neue Datei wird geloescht, das Original bleibt.
+    /// </summary>
+    /// <param name="id">Die Job-Id.</param>
+    /// <param name="token">Abbruch-Token.</param>
+    /// <returns>Fehlertext oder null.</returns>
+    public async Task<string?> RejectAsync(string id, CancellationToken token)
+    {
+        await _approvalLock.WaitAsync(token).ConfigureAwait(false);
+        try
+        {
+            var job = _store.Find(id);
+            if (job is null)
+            {
+                return "Job nicht gefunden.";
+            }
+
+            if (job.State != JobState.AwaitingApproval)
+            {
+                return "Dieser Job wartet nicht auf Freigabe.";
+            }
+
+            if (IsBeingPlayed(job))
+            {
+                return "Die Datei wird gerade abgespielt. Bitte nach der Wiedergabe verwerfen.";
+            }
+
+            if (!File.Exists(job.SourcePath))
+            {
+                return "Das Original fehlt. Die umgewandelte Datei wird deshalb nicht gelöscht.";
+            }
+
+            try
+            {
+                var target = new FileInfo(job.TargetPath);
+                if (target.Exists || target.LinkTarget is not null)
+                {
+                    target.Delete();
+                }
+
+                foreach (var sidecar in job.Sidecars)
+                {
+                    DeleteIfExists(sidecar.Copy);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return "Die umgewandelte Datei konnte nicht gelöscht werden: " + ex.Message;
+            }
+
+            _store.Update(job, j =>
+            {
+                j.State = JobState.Rejected;
+                j.Finished = DateTime.UtcNow;
+                j.Message = "Verworfen, das Original bleibt.";
+            });
+            _logger.LogInformation("Codec Converter: {Name} verworfen, {Path} gelöscht", job.Name, job.TargetPath);
+            RefreshLibrary(job);
+            return null;
+        }
+        finally
+        {
+            _approvalLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Gibt alle wartenden Jobs frei.
+    /// </summary>
+    /// <param name="token">Abbruch-Token.</param>
+    /// <returns>Anzahl der Freigaben und die Fehlertexte.</returns>
+    public async Task<(int Approved, List<string> Errors)> ApproveAllAsync(CancellationToken token)
+    {
+        var approved = 0;
+        var errors = new List<string>();
+        foreach (var id in _store.IdsInState(JobState.AwaitingApproval))
+        {
+            var error = await ApproveAsync(id, false, token).ConfigureAwait(false);
+            if (error is null)
+            {
+                approved++;
+            }
+            else
+            {
+                errors.Add((_store.Find(id)?.Name ?? id) + ": " + error);
+            }
+        }
+
+        return (approved, errors);
+    }
+
+    /// <summary>
+    /// Gibt Jobs frei, deren Frist abgelaufen ist.
+    /// </summary>
+    private async Task AutoApproveAsync(CancellationToken token)
+    {
+        // Kurz nach dem Serverstart ist Jellyfins ffmpeg noch nicht bereit, die neue Datei liesse sich nicht pruefen.
+        if (DateTime.UtcNow - _lastAutoApprove < TimeSpan.FromMinutes(10) || string.IsNullOrEmpty(_mediaEncoder.EncoderPath) || string.IsNullOrEmpty(_mediaEncoder.ProbePath))
+        {
+            return;
+        }
+
+        _lastAutoApprove = DateTime.UtcNow;
+        var days = AutoApproveDays;
+        if (days <= 0)
+        {
+            return;
+        }
+
+        foreach (var id in _store.IdsInState(JobState.AwaitingApproval))
+        {
+            var job = _store.Find(id);
+            if (job?.Converted is null || DateTime.UtcNow - job.Converted.Value < TimeSpan.FromDays(days))
+            {
+                continue;
+            }
+
+            var error = await ApproveAsync(id, true, token).ConfigureAwait(false);
+            if (error is not null)
+            {
+                // Bleibt wartend und wird beim naechsten Durchlauf erneut versucht.
+                _logger.LogInformation("Codec Converter: automatische Freigabe von {Name} verschoben: {Error}", job.Name, error);
+            }
         }
     }
 
@@ -1048,10 +1334,7 @@ public sealed class JobRunner : IHostedService, IDisposable
         {
             _index.Invalidate();
             _libraryMonitor.ReportFileSystemChanged(job.TargetPath);
-            if (!string.Equals(job.TargetPath, job.SourcePath, StringComparison.Ordinal))
-            {
-                _libraryMonitor.ReportFileSystemChanged(job.SourcePath);
-            }
+            _libraryMonitor.ReportFileSystemChanged(job.SourcePath);
         }
         catch (Exception ex)
         {
@@ -1067,7 +1350,7 @@ public sealed class JobRunner : IHostedService, IDisposable
         foreach (var snapshot in _store.Snapshot())
         {
             var job = _store.Find(snapshot.Id);
-            if (job is null || !JobStore.IsOpen(job) || job.State == JobState.Queued)
+            if (job is null || job.State is not (JobState.Running or JobState.Paused or JobState.Finalizing))
             {
                 continue;
             }
@@ -1144,17 +1427,16 @@ public sealed class JobRunner : IHostedService, IDisposable
     {
         var tempExists = File.Exists(job.TempPath);
         var sourceExists = File.Exists(job.SourcePath);
-        var backupExists = job.BackupFile is not null && File.Exists(job.BackupFile);
 
-        if (tempExists && backupExists && !sourceExists)
+        if (tempExists && !sourceExists && job.BackupFile is not null && File.Exists(job.BackupFile))
         {
-            // Das Original war schon gesichert, nur das Umbenennen der neuen Datei fehlte noch.
+            // Stand aus Version 1.0: das Original lag schon im Sicherungsordner, nur das Umbenennen fehlte.
             File.Move(job.TempPath, job.TargetPath, false);
-            var size = new FileInfo(job.TargetPath).Length;
+            var legacySize = new FileInfo(job.TargetPath).Length;
             _store.Update(job, j =>
             {
                 j.State = JobState.Done;
-                j.ResultSize = size;
+                j.ResultSize = legacySize;
                 j.Finished = DateTime.UtcNow;
                 j.Message = "Original gesichert unter " + j.BackupFile;
             });
@@ -1163,30 +1445,37 @@ public sealed class JobRunner : IHostedService, IDisposable
 
         if (tempExists)
         {
-            // Solange die temporaere Datei existiert, ist die Datei am Quellpfad das Original.
-            // Eine angefangene Kopie im Sicherungsordner ist unvollstaendig und wird verworfen.
-            if (sourceExists && backupExists)
-            {
-                File.Delete(job.BackupFile!);
-            }
-
+            // Die neue Datei war noch nicht an ihrem Platz: verwerfen und neu umwandeln.
             File.Delete(job.TempPath);
             _store.Update(job, j =>
             {
                 j.State = sourceExists ? JobState.Queued : JobState.Failed;
                 j.Progress = 0;
-                j.BackupFile = null;
                 j.Message = sourceExists ? null : "Nach einem Absturz fehlt die Quelldatei. Bitte von Hand prüfen.";
             });
             return;
         }
 
-        var done = File.Exists(job.TargetPath) && backupExists;
+        if (File.Exists(job.TargetPath) && sourceExists)
+        {
+            // Die neue Datei liegt schon neben dem Original, nur der Vermerk fehlte.
+            var size = new FileInfo(job.TargetPath).Length;
+            _store.Update(job, j =>
+            {
+                j.State = JobState.AwaitingApproval;
+                j.ResultSize = size;
+                j.Finished = DateTime.UtcNow;
+                j.Converted = DateTime.UtcNow;
+                j.Message = "Neue Datei: " + Path.GetFileName(j.TargetPath) + ". Das Original bleibt bis zur Freigabe erhalten.";
+            });
+            return;
+        }
+
         _store.Update(job, j =>
         {
-            j.State = done ? JobState.Done : JobState.Failed;
+            j.State = JobState.Failed;
             j.Finished = DateTime.UtcNow;
-            j.Message = done ? "Original gesichert unter " + j.BackupFile : "Nach einem Absturz ist der Stand unklar. Bitte von Hand prüfen.";
+            j.Message = "Nach einem Absturz ist der Stand unklar. Bitte von Hand prüfen.";
         });
     }
 

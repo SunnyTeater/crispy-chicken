@@ -188,8 +188,17 @@
                 };
                 var runningStates = ['Queued', 'Running', 'Paused', 'Finalizing'];
 
+                // Jellyfin setzt Dialogtexte als HTML ein. Dateinamen und Servermeldungen duerfen dort nur als Text ankommen.
+                function plain(text) {
+                    return String(text == null ? '' : text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+                }
+
+                function notify(message) {
+                    Dashboard.alert({ title: 'Codec Converter', message: plain(message) });
+                }
+
                 function confirmAction(message, action) {
-                    Dashboard.confirm(message, 'Codec Converter', function (confirmed) {
+                    Dashboard.confirm(plain(message), 'Codec Converter', function (confirmed) {
                         if (confirmed) {
                             action();
                         }
@@ -221,7 +230,7 @@
 
                 function showError(error) {
                     Dashboard.hideLoadingMsg();
-                    Dashboard.alert({ title: 'Codec Converter', message: error.message });
+                    notify(error.message);
                 }
 
                 function el(tag, className, text) {
@@ -565,13 +574,14 @@
 
                 function renderJobs(result) {
                     var status = $('#ccStatus');
-                    var open = result.Jobs.filter(function (job) { return runningStates.indexOf(job.State) !== -1; }).length;
-                    var awaiting = result.Jobs.filter(function (job) { return job.State === 'AwaitingApproval'; }).length;
+                    var open = result.OpenCount;
+                    var awaiting = result.AwaitingCount;
                     status.className = 'ccStatus' + (result.IsBlocked ? ' ccBlocked' : '');
                     status.textContent = 'Aktive Streams: ' + result.ActiveStreams + ' (Jobs laufen bei weniger als ' + result.StreamLimit + '). '
                         + (result.IsBlocked ? 'Die Umwandlung pausiert gerade. ' : '')
                         + 'Offene Jobs: ' + open + (open && duration(result.QueueEtaSeconds) ? ' (restliche Rechenzeit ' + duration(result.QueueEtaSeconds) + ')' : '')
-                        + '. Warten auf Freigabe: ' + awaiting + '.';
+                        + '. Warten auf Freigabe: ' + awaiting + '.'
+                        + (result.Total > result.Jobs.length ? ' Angezeigt werden ' + result.Jobs.length + ' von ' + result.Total + ' Jobs.' : '');
                     $('#ccApproveAll').disabled = awaiting === 0;
 
                     var body = $('#ccJobs');
@@ -614,7 +624,7 @@
                         if (job.State === 'AwaitingApproval') {
                             state.appendChild(el('div', 'ccSmall', job.AutoApproveAt
                                 ? 'Automatische Freigabe am ' + new Date(job.AutoApproveAt).toLocaleDateString('de-DE') + '.'
-                                : 'Keine automatische Freigabe eingestellt.'));
+                                : (job.SourceErrors > 0 ? 'Keine automatische Freigabe wegen der Lesefehler.' : 'Keine automatische Freigabe eingestellt.')));
                         }
                         row.appendChild(state);
 
@@ -659,7 +669,7 @@
                 function refreshJobs() {
                     return request('GET', 'Jobs').then(function (result) {
                         renderJobs(result);
-                        var open = result.Jobs.filter(function (job) { return runningStates.indexOf(job.State) !== -1; }).length;
+                        var open = result.OpenCount;
 
                         // Nach einem fertigen Job dauert es etwa eine Minute, bis Jellyfin die neue Datei eingelesen hat.
                         // In dieser Zeit die Auswahl regelmaessig auffrischen.
@@ -773,7 +783,7 @@
                 $('#ccPlan').addEventListener('click', function () {
                     var body = buildRequest();
                     if (!body.ItemIds.length) {
-                        Dashboard.alert({ title: 'Codec Converter', message: 'Bitte zuerst Filme oder Folgen auswählen.' });
+                        notify('Bitte zuerst Filme oder Folgen auswählen.');
                         return;
                     }
                     Dashboard.showLoadingMsg();
@@ -784,7 +794,7 @@
                         if (result.Skipped.length) {
                             message += ' Übersprungen: ' + result.Skipped.slice(0, 10).join('; ') + (result.Skipped.length > 10 ? ' und ' + (result.Skipped.length - 10) + ' weitere' : '') + '.';
                         }
-                        Dashboard.alert({ title: 'Codec Converter', message: message });
+                        notify(message);
                         return Promise.all([loadItems(false), refreshJobs()]);
                     }).catch(showError);
                 });
@@ -798,7 +808,7 @@
                             if (result.Errors.length) {
                                 message += ' Nicht freigegeben: ' + result.Errors.slice(0, 10).join('; ') + '.';
                             }
-                            Dashboard.alert({ title: 'Codec Converter', message: message });
+                            notify(message);
                             return refreshJobs().then(function () { return loadItems(false); });
                         }).catch(showError);
                     });

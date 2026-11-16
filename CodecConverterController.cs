@@ -20,6 +20,7 @@ namespace Jellyfin.Plugin.CodecConverter.Api;
 public class CodecConverterController : ControllerBase
 {
     private const int MaxItemsPerRequest = 5000;
+    private const int MaxJobsPerResponse = 300;
 
     private readonly LibraryIndex _index;
     private readonly JobStore _store;
@@ -111,7 +112,7 @@ public class CodecConverterController : ControllerBase
         }
 
         var wanted = request.ItemIds.ToHashSet();
-        var history = _store.Snapshot();
+        var speeds = JobRunner.BuildSpeedTable(_store.Snapshot());
         long source = 0;
         long estimated = 0;
         var count = 0;
@@ -124,7 +125,7 @@ public class CodecConverterController : ControllerBase
             count++;
 
             // Rechenzeit aus der Geschwindigkeit frueherer Jobs mit demselben Encoder.
-            var speed = JobRunner.ExpectedSpeed(encoder!.Name, request.Speed, entry.Width, entry.Height, entry.Fps, history);
+            var speed = JobRunner.ExpectedSpeed(speeds, encoder!.Name, request.Speed, entry.Width, entry.Height, entry.Fps);
             if (speed is null || entry.DurationSeconds <= 0)
             {
                 timeKnown = false;
@@ -168,8 +169,39 @@ public class CodecConverterController : ControllerBase
     public ActionResult GetJobs()
     {
         var all = _store.Snapshot();
-        var etas = all.ToDictionary(j => j.Id, j => j.State is JobState.Queued or JobState.Running or JobState.Paused ? JobRunner.EstimateSeconds(j, all) : null);
-        var pending = etas.Where(e => all.First(j => j.Id == e.Key).State is JobState.Queued or JobState.Running or JobState.Paused).ToList();
+        var speeds = JobRunner.BuildSpeedTable(all);
+        var etas = new Dictionary<string, double?>(all.Count);
+        double queueSeconds = 0;
+        var queueKnown = true;
+        var pendingCount = 0;
+        foreach (var job in all)
+        {
+            var pending = job.State is JobState.Queued or JobState.Running or JobState.Paused;
+            var eta = pending ? JobRunner.EstimateSeconds(job, speeds) : null;
+            etas[job.Id] = eta;
+            if (pending)
+            {
+                pendingCount++;
+                queueKnown &= eta.HasValue;
+                queueSeconds += eta ?? 0;
+            }
+        }
+
+        // Die Seite fragt alle paar Sekunden ab: bei sehr langen Listen nur das Wichtige schicken. Zuerst alles, was
+        // laeuft oder eine Entscheidung braucht, dann die Wartenden in ihrer Reihenfolge, dann die neuesten Abgeschlossenen.
+        static int Rank(Job j) => j.State switch
+        {
+            JobState.Running or JobState.Paused or JobState.Finalizing => 0,
+            JobState.AwaitingApproval => 1,
+            JobState.Queued => 2,
+            _ => 3
+        };
+
+        var shown = all
+            .OrderBy(Rank)
+            .ThenBy(j => j.State == JobState.Queued ? j.Created.Ticks : -j.Created.Ticks)
+            .Take(MaxJobsPerResponse)
+            .ToList();
 
         return Ok(new
         {
@@ -178,8 +210,11 @@ public class CodecConverterController : ControllerBase
             _runner.IsBlocked,
 
             // Restliche Rechenzeit der ganzen Warteschlange; null, solange fuer einen Job noch kein Erfahrungswert da ist.
-            QueueEtaSeconds = pending.Count > 0 && pending.All(e => e.Value.HasValue) ? pending.Sum(e => e.Value!.Value) : (double?)null,
-            Jobs = all.Select(j => new
+            QueueEtaSeconds = pendingCount > 0 && queueKnown ? queueSeconds : (double?)null,
+            Total = all.Count,
+            OpenCount = all.Count(j => j.State is JobState.Queued or JobState.Running or JobState.Paused or JobState.Finalizing),
+            AwaitingCount = all.Count(j => j.State == JobState.AwaitingApproval),
+            Jobs = shown.Select(j => new
             {
                 j.Id,
                 j.Name,
@@ -202,7 +237,8 @@ public class CodecConverterController : ControllerBase
                 TargetName = Path.GetFileName(j.TargetPath),
 
                 // Zeitpunkt der automatischen Freigabe, falls eine Frist gesetzt ist.
-                AutoApproveAt = j.State == JobState.AwaitingApproval && j.Converted.HasValue && _runner.AutoApproveDays > 0
+                j.SourceErrors,
+                AutoApproveAt = j.State == JobState.AwaitingApproval && j.Converted.HasValue && _runner.AutoApproveDays > 0 && j.SourceErrors == 0
                     ? j.Converted.Value.AddDays(_runner.AutoApproveDays)
                     : (DateTime?)null
             })

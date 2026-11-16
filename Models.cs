@@ -135,6 +135,9 @@ public sealed class Job
     /// <summary>Gets or sets die mittlere Geschwindigkeit des fertigen Jobs relativ zur Echtzeit. Grundlage fuer die Zeitschaetzung weiterer Jobs.</summary>
     public double AverageSpeed { get; set; }
 
+    /// <summary>Gets or sets die Zahl der Fehlermeldungen, die ffmpeg beim Lesen der Quelle ausgegeben hat, obwohl die Umwandlung durchlief.</summary>
+    public int SourceErrors { get; set; }
+
     public int Width { get; set; }
 
     public int Height { get; set; }
@@ -156,6 +159,18 @@ public sealed class Job
 
     /// <summary>Gets or sets den Gesehen-Stand der Benutzer, der nach der Freigabe noch auf die neue Datei zu uebertragen ist.</summary>
     public List<UserState> PendingUserStates { get; set; } = new();
+
+    /// <summary>
+    /// Kopiert den Job. Die Listen werden neu angelegt, ihre Eintraege aendern sich nach dem Anlegen nicht mehr.
+    /// </summary>
+    /// <returns>Die Kopie.</returns>
+    public Job Copy()
+    {
+        var copy = (Job)MemberwiseClone();
+        copy.Sidecars = new List<SidecarCopy>(Sidecars);
+        copy.PendingUserStates = new List<UserState>(PendingUserStates);
+        return copy;
+    }
 }
 
 /// <summary>

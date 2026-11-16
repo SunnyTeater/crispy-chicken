@@ -46,6 +46,10 @@ public sealed class JobRunner : IHostedService, IDisposable
     };
 
     private static readonly TimeSpan StallTimeout = TimeSpan.FromMinutes(60);
+
+    // So viel bleibt auf dem Datentraeger der Medien immer frei. Ein randvoller Datentraeger legt mehr lahm als
+    // nur die Umwandlung (Downloads, andere Dienste, bei gleichem Datentraeger auch Jellyfins Datenbank).
+    private const long MinFreeBytes = 256L * 1024 * 1024;
     private const string BackupMarker = ".codec-converter-backup";
 
     private readonly JobStore _store;
@@ -63,6 +67,7 @@ public sealed class JobRunner : IHostedService, IDisposable
     private DateTime _lastProgressLog = DateTime.MinValue;
     private bool? _lastBlocked;
     private double? _currentExpectedSpeed;
+    private DateTime _lastDeletedCheck = DateTime.MinValue;
     private readonly CancellationTokenSource _stopping = new();
     private readonly object _lock = new();
     private readonly object _planLock = new();
@@ -149,14 +154,14 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// <param name="job">Der Job (Kopie oder Original).</param>
     /// <param name="all">Alle Jobs.</param>
     /// <returns>Sekunden oder null, wenn noch keine Grundlage da ist.</returns>
-    public static double? EstimateSeconds(Job job, IReadOnlyList<Job> all)
+    public static double? EstimateSeconds(Job job, IReadOnlyDictionary<(string Encoder, string Speed), double> speeds)
     {
         if (job.DurationSeconds <= 0)
         {
             return null;
         }
 
-        var expected = ExpectedSpeed(job.Encoder, job.Speed, job.Width, job.Height, job.Fps, all.Where(j => !string.Equals(j.Id, job.Id, StringComparison.Ordinal)).ToList());
+        var expected = ExpectedSpeed(speeds, job.Encoder, job.Speed, job.Width, job.Height, job.Fps);
         if (job.State is JobState.Running or JobState.Paused)
         {
             // Der Encoder liefert die ersten Bilder mit Verzoegerung: ganz am Anfang wirkt der Job langsamer, als er ist.
@@ -179,53 +184,78 @@ public sealed class JobRunner : IHostedService, IDisposable
     }
 
     /// <summary>
+    /// Bildet aus der Job-Liste je Encoder und Geschwindigkeitsstufe den Erfahrungswert "Bildpunkte pro Sekunde
+    /// Rechenzeit" (Median der letzten fuenf Jobs). Ein Durchlauf ueber alle Jobs, damit die Abfragen der Seite
+    /// auch bei Tausenden Jobs schnell bleiben.
+    /// </summary>
+    /// <param name="all">Alle Jobs.</param>
+    /// <returns>Die Tabelle.</returns>
+    public static Dictionary<(string Encoder, string Speed), double> BuildSpeedTable(IReadOnlyList<Job> all)
+    {
+        var samples = new Dictionary<(string, string), List<(DateTime When, double Throughput)>>();
+        foreach (var job in all)
+        {
+            if (job.Width <= 0 || job.Height <= 0)
+            {
+                continue;
+            }
+
+            double speed = 0;
+            if (job.AverageSpeed > 0)
+            {
+                speed = job.AverageSpeed;
+            }
+            else if (job.State is JobState.Running or JobState.Paused && job.ActiveSeconds >= 30 && job.Progress >= 0.02)
+            {
+                speed = job.Progress * job.DurationSeconds / job.ActiveSeconds;
+            }
+
+            if (speed <= 0)
+            {
+                continue;
+            }
+
+            var key = (job.Encoder, job.Speed);
+            if (!samples.TryGetValue(key, out var list))
+            {
+                samples[key] = list = new List<(DateTime, double)>();
+            }
+
+            list.Add((job.Started ?? job.Created, speed * Load(job.Width, job.Height, job.Fps)));
+        }
+
+        var table = new Dictionary<(string, string), double>();
+        foreach (var (key, list) in samples)
+        {
+            var recent = list.OrderByDescending(s => s.When).Take(5).Select(s => s.Throughput).OrderBy(t => t).ToList();
+            table[key] = recent[recent.Count / 2];
+        }
+
+        return table;
+    }
+
+    /// <summary>
     /// Erwartete Geschwindigkeit (Vielfaches der Echtzeit) fuer einen Encoder bei gegebener Aufloesung.
     /// </summary>
+    /// <param name="speeds">Die Tabelle aus <see cref="BuildSpeedTable"/>.</param>
     /// <param name="encoder">Der Encoder.</param>
     /// <param name="speedSetting">Die Geschwindigkeitsstufe.</param>
     /// <param name="width">Breite.</param>
     /// <param name="height">Hoehe.</param>
     /// <param name="fps">Bildrate.</param>
-    /// <param name="all">Alle Jobs.</param>
     /// <returns>Geschwindigkeit oder null ohne Erfahrungswerte.</returns>
-    public static double? ExpectedSpeed(string encoder, string speedSetting, int width, int height, double fps, IReadOnlyList<Job> all)
+    public static double? ExpectedSpeed(IReadOnlyDictionary<(string Encoder, string Speed), double> speeds, string encoder, string speedSetting, int width, int height, double fps)
     {
-        static double Load(int w, int h, double f) => Math.Max(1, w) * (double)Math.Max(1, h) * (f is > 1 and < 300 ? f : 24);
-
-        // Bildpunkte pro Sekunde Rechenzeit, die der Encoder zuletzt geschafft hat.
-        var samples = new List<double>();
-        foreach (var other in all.Where(j => string.Equals(j.Encoder, encoder, StringComparison.Ordinal)
-                     && string.Equals(j.Speed, speedSetting, StringComparison.Ordinal)
-                     && j.Width > 0 && j.Height > 0).OrderByDescending(j => j.Started ?? j.Created))
-        {
-            double speed = 0;
-            if (other.AverageSpeed > 0)
-            {
-                speed = other.AverageSpeed;
-            }
-            else if (other.State is JobState.Running or JobState.Paused && other.ActiveSeconds >= 30 && other.Progress >= 0.02)
-            {
-                speed = other.Progress * other.DurationSeconds / other.ActiveSeconds;
-            }
-
-            if (speed > 0)
-            {
-                samples.Add(speed * Load(other.Width, other.Height, other.Fps));
-                if (samples.Count == 5)
-                {
-                    break;
-                }
-            }
-        }
-
-        if (samples.Count == 0 || width <= 0 || height <= 0)
+        if (width <= 0 || height <= 0 || !speeds.TryGetValue((encoder, speedSetting), out var throughput))
         {
             return null;
         }
 
-        samples.Sort();
-        return samples[samples.Count / 2] / Load(width, height, fps);
+        return throughput / Load(width, height, fps);
     }
+
+    private static double Load(int width, int height, double fps)
+        => Math.Max(1, width) * (double)Math.Max(1, height) * (fps is > 1 and < 300 ? fps : 24);
 
     /// <summary>
     /// Ob die Datei eines Jobs gerade in einer Sitzung abgespielt wird.
@@ -421,6 +451,12 @@ public sealed class JobRunner : IHostedService, IDisposable
                 case JobState.Finalizing:
                     return "Der Job wird gerade abgeschlossen und kann nicht mehr abgebrochen werden.";
                 case JobState.AwaitingApproval:
+                    if (FilesDeleted(job) is not null)
+                    {
+                        _store.Remove(j => string.Equals(j.Id, id, StringComparison.Ordinal));
+                        return null;
+                    }
+
                     return "Dieser Job wartet auf Freigabe: bitte freigeben oder verwerfen.";
                 default:
                     if (job.PendingUserStates.Count > 0)
@@ -430,6 +466,100 @@ public sealed class JobRunner : IHostedService, IDisposable
 
                     _store.Remove(j => string.Equals(j.Id, id, StringComparison.Ordinal));
                     return null;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Prueft, ob die Dateien eines Jobs ausserhalb des Plugins geloescht wurden (im Dateisystem oder ueber Jellyfin).
+    /// Liefert den Grund oder null. Ist die Bibliothek gerade nicht erreichbar (Netzlaufwerk nicht eingehaengt),
+    /// gilt nichts als geloescht: sonst ginge bei einem Ausfall die ganze Warteschlange verloren.
+    /// </summary>
+    private string? FilesDeleted(Job job)
+    {
+        try
+        {
+            var sourceGone = !File.Exists(job.SourcePath);
+            var targetGone = job.State == JobState.AwaitingApproval && !File.Exists(job.TargetPath);
+            if ((!sourceGone && !targetGone) || !LibraryReachable(job.SourcePath))
+            {
+                return null;
+            }
+
+            if (job.State == JobState.Queued)
+            {
+                return "die Datei wurde gelöscht";
+            }
+
+            return sourceGone && targetGone ? "Original und neue Datei wurden gelöscht"
+                : sourceGone ? "das Original wurde gelöscht, die neue Datei bleibt"
+                : "die neue Datei wurde gelöscht, das Original bleibt";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    private bool LibraryReachable(string path)
+    {
+        var full = Path.GetFullPath(path);
+        foreach (var location in _libraryManager.GetVirtualFolders().SelectMany(f => f.Locations ?? Array.Empty<string>()))
+        {
+            var library = WithSeparator(Path.GetFullPath(location));
+            if (full.StartsWith(library, StringComparison.Ordinal))
+            {
+                return Directory.Exists(library) && Directory.EnumerateFileSystemEntries(library).Any();
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Nimmt Jobs aus der Warteschlange, deren Dateien inzwischen geloescht wurden: wartende Jobs ohne Quelle und
+    /// Jobs vor der Freigabe, bei denen Original oder neue Datei fehlt (dann gibt es nichts mehr zu entscheiden).
+    /// </summary>
+    private void RemoveJobsOfDeletedFiles()
+    {
+        if (DateTime.UtcNow - _lastDeletedCheck < TimeSpan.FromSeconds(30))
+        {
+            return;
+        }
+
+        _lastDeletedCheck = DateTime.UtcNow;
+        try
+        {
+            RemoveJobsOfDeletedFilesCore();
+        }
+        catch (Exception ex)
+        {
+            // Aufraeumen ist Nebensache: ein Fehler hier darf keine laufende Umwandlung stoeren.
+            _logger.LogWarning(ex, "Codec Converter: Pruefung auf geloeschte Dateien fehlgeschlagen");
+        }
+    }
+
+    private void RemoveJobsOfDeletedFilesCore()
+    {
+        foreach (var snapshot in _store.Snapshot().Where(j => j.State is JobState.Queued or JobState.AwaitingApproval))
+        {
+            lock (_lock)
+            {
+                var job = _store.Find(snapshot.Id);
+                if (job is null || job.State != snapshot.State || string.Equals(_currentJobId, job.Id, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var reason = FilesDeleted(job);
+                if (reason is null)
+                {
+                    continue;
+                }
+
+                _store.Remove(j => string.Equals(j.Id, job.Id, StringComparison.Ordinal));
+                _log.Add("Aus der Warteschlange entfernt: " + job.Name + " (" + reason + ").");
+                _logger.LogInformation("Codec Converter: Job {Name} entfernt, {Reason}", job.Name, reason);
             }
         }
     }
@@ -472,6 +602,12 @@ public sealed class JobRunner : IHostedService, IDisposable
 
     private static string DisplayName(MediaEntry entry)
     {
+        // Steuerzeichen (etwa Zeilenumbrueche in Dateinamen) koennten in Protokollen zusaetzliche Zeilen vortaeuschen.
+        return new string(RawDisplayName(entry).Select(c => char.IsControl(c) ? ' ' : c).ToArray());
+    }
+
+    private static string RawDisplayName(MediaEntry entry)
+    {
         if (entry.Type == "Episode")
         {
             var number = entry.Season.HasValue && entry.Episode.HasValue
@@ -504,6 +640,7 @@ public sealed class JobRunner : IHostedService, IDisposable
             try
             {
                 CleanupBackups();
+                RemoveJobsOfDeletedFiles();
                 await AutoApproveAsync(token).ConfigureAwait(false);
                 RestoreUserStates();
 
@@ -550,6 +687,37 @@ public sealed class JobRunner : IHostedService, IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Uebersetzt haeufige ffmpeg-Fehler in einen Satz, der die Ursache nennt.
+    /// </summary>
+    private static string ExplainFailure(string errorText)
+    {
+        // Reihenfolge wichtig: ein Encoder, der nicht startet, zieht dieselben Folgemeldungen nach sich wie eine unlesbare Quelle.
+        if (errorText.Contains("Cannot open libx265 encoder", StringComparison.Ordinal)
+            || errorText.Contains("Error while opening encoder", StringComparison.Ordinal)
+            || errorText.Contains("Error initializing output stream", StringComparison.Ordinal))
+        {
+            return "Der Encoder ließ sich mit diesen Einstellungen nicht starten; die erste ffmpeg-Zeile nennt den Grund (bei Hardware-Encodern meist fehlende Grafikkarte oder Treiber). Das Original wurde nicht angetastet. ";
+        }
+
+        if (errorText.Contains("Cannot determine format of input", StringComparison.Ordinal))
+        {
+            return "Die Videospur der Quelle lieferte kein einziges lesbares Bild: die Datei ist beschädigt oder unvollständig, oder Jellyfins ffmpeg kann ihren Codec nicht dekodieren. Das Original wurde nicht angetastet. ";
+        }
+
+        if (errorText.Contains("No space left on device", StringComparison.Ordinal))
+        {
+            return "Der Datenträger ist voll. Das Original wurde nicht angetastet. ";
+        }
+
+        if (errorText.Contains("Permission denied", StringComparison.Ordinal))
+        {
+            return "Dem Jellyfin-Dienst fehlen Schreibrechte im Ordner der Datei. Das Original wurde nicht angetastet. ";
+        }
+
+        return string.Empty;
     }
 
     private static string Clock(double seconds)
@@ -604,11 +772,13 @@ public sealed class JobRunner : IHostedService, IDisposable
 
         try
         {
-            // Original und neue Datei liegen bis zur Freigabe nebeneinander.
-            var needed = (long)(Math.Max(job.EstimatedSize, 0) * 1.1) + (64L * 1024 * 1024);
+            // Original und neue Datei liegen bis zur Freigabe nebeneinander. Die Schaetzung kann deutlich zu
+            // klein sein, deshalb mit Aufschlag rechnen und die Reserve dazunehmen, die auch waehrend des Laufs gilt.
+            var needed = (long)(Math.Max(job.EstimatedSize, 0) * 1.5) + MinFreeBytes;
             if (new DriveInfo(source.DirectoryName!).AvailableFreeSpace < needed)
             {
-                return "Zu wenig freier Speicher im Medienordner.";
+                return "Zu wenig freier Speicher im Medienordner: nötig sind die geschätzte neue Datei mit Aufschlag und "
+                    + (MinFreeBytes / (1024 * 1024)).ToString(CultureInfo.InvariantCulture) + " MB Reserve.";
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
@@ -725,7 +895,7 @@ public sealed class JobRunner : IHostedService, IDisposable
             if (exitCode != 0)
             {
                 DeleteIfExists(job.TempPath);
-                Fail(job, "ffmpeg ist mit Code " + exitCode + " gescheitert: " + (errorText.Length == 0 ? "keine Fehlermeldung" : errorText));
+                Fail(job, exitCode == -1 ? errorText : ExplainFailure(errorText) + "ffmpeg ist mit Code " + exitCode + " gescheitert: " + (errorText.Length == 0 ? "keine Fehlermeldung" : errorText));
                 return;
             }
 
@@ -775,9 +945,15 @@ public sealed class JobRunner : IHostedService, IDisposable
             startInfo.ArgumentList.Add(argument);
         }
 
+        // SVT-AV1 schreibt sonst bei jedem Lauf Infozeilen in die Fehlerausgabe (1 = nur Fehler).
+        startInfo.Environment["SVT_LOG"] = "1";
+
         using var process = new Process { StartInfo = startInfo };
         var errors = new StringBuilder();
+        var head = new StringBuilder();
+        var errorLines = 0;
         var stalled = false;
+        var diskFull = false;
         process.ErrorDataReceived += (_, e) =>
         {
             if (e.Data is null)
@@ -785,14 +961,36 @@ public sealed class JobRunner : IHostedService, IDisposable
                 return;
             }
 
-            if (e.Data.Length > 0)
+            // Reine Info- und Warnzeilen der Encoder sind keine Fehler.
+            if (e.Data.Length == 0
+                || e.Data.StartsWith("Svt[info]", StringComparison.Ordinal)
+                || e.Data.StartsWith("Svt[warn]", StringComparison.Ordinal)
+                || e.Data.StartsWith("x265 [info]", StringComparison.Ordinal)
+                || e.Data.StartsWith("x265 [warning]", StringComparison.Ordinal))
             {
-                _log.Add("ffmpeg: " + e.Data);
+                return;
             }
 
             lock (errors)
             {
-                // Nur das Ende der Ausgabe aufheben.
+                errorLines++;
+
+                // Eine beschaedigte Datei erzeugt Tausende gleichartiger Meldungen: nur die ersten ins Live-Protokoll.
+                if (errorLines <= 15)
+                {
+                    _log.Add("ffmpeg: " + e.Data);
+                }
+                else if (errorLines == 16)
+                {
+                    _log.Add("ffmpeg: … weitere Meldungen werden nicht mehr einzeln angezeigt.");
+                }
+
+                // Die Ursache steht meist am Anfang, das Ergebnis am Ende: beides aufheben.
+                if (head.Length < 700)
+                {
+                    head.AppendLine(e.Data);
+                }
+
                 errors.AppendLine(e.Data);
                 if (errors.Length > 4000)
                 {
@@ -826,11 +1024,23 @@ public sealed class JobRunner : IHostedService, IDisposable
         _lastOutput = DateTime.UtcNow;
         _lastProgressLog = DateTime.MinValue;
         _progressBlock.Clear();
-        _currentExpectedSpeed = ExpectedSpeed(job.Encoder, job.Speed, job.Width, job.Height, job.Fps, _store.Snapshot().Where(j => !string.Equals(j.Id, job.Id, StringComparison.Ordinal)).ToList());
+        _currentExpectedSpeed = ExpectedSpeed(BuildSpeedTable(_store.Snapshot()), job.Encoder, job.Speed, job.Width, job.Height, job.Fps);
         _activeWatch.Restart();
         _store.Update(job, j => j.ActiveSeconds = 0, persist: false);
         while (!process.HasExited)
         {
+            // Auch waehrend einer langen Umwandlung aufraeumen, nicht erst danach.
+            RemoveJobsOfDeletedFiles();
+
+            if (!paused && FreeSpaceLow(job))
+            {
+                // Die neue Datei wird groesser als geschaetzt und der Datentraeger laeuft voll: abbrechen, bevor er voll ist.
+                _log.Add("Freier Speicher im Medienordner unter " + (MinFreeBytes / (1024 * 1024)).ToString(CultureInfo.InvariantCulture) + " MB, breche ab.");
+                KillProcess();
+                diskFull = true;
+                break;
+            }
+
             if (!paused && DateTime.UtcNow - _lastOutput > StallTimeout)
             {
                 // Ein haengendes ffmpeg wuerde sonst die ganze Warteschlange blockieren.
@@ -890,14 +1100,27 @@ public sealed class JobRunner : IHostedService, IDisposable
         _store.Update(job, j => j.ActiveSeconds = _activeWatch.Elapsed.TotalSeconds, persist: false);
 
         string errorText;
+        int sourceErrors;
         lock (errors)
         {
-            errorText = errors.ToString().Trim();
+            sourceErrors = errorLines;
+            var all = errors.ToString().Trim();
+            var start = head.ToString().Trim();
+            if (start.Length > 500)
+            {
+                start = start[..500];
+            }
+
+            // Kurze Ausgaben ganz, lange als Anfang und Ende.
+            errorText = all.Length <= 1000 ? all : start + " … " + all[^450..];
         }
 
-        if (errorText.Length > 600)
+        _store.Update(job, j => j.SourceErrors = sourceErrors, persist: false);
+
+        if (diskFull)
         {
-            errorText = "…" + errorText[^600..];
+            return (-1, "Der Datenträger wurde zu voll: die neue Datei wird größer als geschätzt. Abgebrochen, damit mindestens "
+                + (MinFreeBytes / (1024 * 1024)).ToString(CultureInfo.InvariantCulture) + " MB frei bleiben. Das Original wurde nicht angetastet.", false);
         }
 
         if (stalled)
@@ -976,6 +1199,18 @@ public sealed class JobRunner : IHostedService, IDisposable
                 Clock(job.DurationSeconds),
                 megabytes,
                 remaining is null ? "?" : Clock(remaining.Value)));
+        }
+    }
+
+    private static bool FreeSpaceLow(Job job)
+    {
+        try
+        {
+            return new DriveInfo(Path.GetDirectoryName(job.TempPath)!).AvailableFreeSpace < MinFreeBytes;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return false;
         }
     }
 
@@ -1150,8 +1385,16 @@ public sealed class JobRunner : IHostedService, IDisposable
             j.Finished = DateTime.UtcNow;
             j.Converted = DateTime.UtcNow;
             j.Sidecars = sidecars;
-            j.Message = "Neue Datei: " + Path.GetFileName(j.TargetPath) + ". Das Original bleibt bis zur Freigabe erhalten.";
+            j.Message = "Neue Datei: " + Path.GetFileName(j.TargetPath) + ". Das Original bleibt bis zur Freigabe erhalten."
+                + (j.SourceErrors > 0
+                    ? " Achtung: ffmpeg meldete " + j.SourceErrors + " Fehler beim Lesen der Quelle, sie ist vermutlich stellenweise beschädigt. Bitte die neue Datei vor der Freigabe ansehen; automatisch wird sie nicht freigegeben."
+                    : string.Empty);
         });
+        if (job.SourceErrors > 0)
+        {
+            _log.Add("ACHTUNG " + job.Name + ": ffmpeg meldete " + job.SourceErrors + " Fehler beim Lesen der Quelle. Keine automatische Freigabe.");
+        }
+
         _logger.LogInformation("Codec Converter: {Name} umgewandelt, {Before} -> {After} Bytes, wartet auf Freigabe", job.Name, job.SourceSize, size);
         _log.Add(string.Format(
             CultureInfo.InvariantCulture,
@@ -1230,6 +1473,12 @@ public sealed class JobRunner : IHostedService, IDisposable
             if (IsBeingPlayed(job))
             {
                 return "Die Datei wird gerade abgespielt. Bitte nach der Wiedergabe freigeben.";
+            }
+
+            if (string.Equals(Path.GetFullPath(job.SourcePath), Path.GetFullPath(job.TargetPath), StringComparison.Ordinal))
+            {
+                // Darf nie vorkommen; trotzdem absichern: sonst wuerde die einzige Datei geloescht.
+                return "Original und neue Datei sind dieselbe Datei. Es wird nichts gelöscht.";
             }
 
             // Vor dem Loeschen des Originals noch einmal sicherstellen, dass die neue Datei da und abspielbar ist.
@@ -1517,7 +1766,8 @@ public sealed class JobRunner : IHostedService, IDisposable
         foreach (var id in _store.IdsInState(JobState.AwaitingApproval))
         {
             var job = _store.Find(id);
-            if (job?.Converted is null || DateTime.UtcNow - job.Converted.Value < TimeSpan.FromDays(days))
+            // Umwandlungen mit Lesefehlern in der Quelle gibt nur ein Mensch frei.
+            if (job?.Converted is null || job.SourceErrors > 0 || DateTime.UtcNow - job.Converted.Value < TimeSpan.FromDays(days))
             {
                 continue;
             }

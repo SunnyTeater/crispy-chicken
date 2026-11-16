@@ -56,7 +56,7 @@ public sealed class JobStore
     {
         lock (_lock)
         {
-            return _jobs.Select(Clone).OrderByDescending(j => j.Created).ToList();
+            return _jobs.Select(j => j.Copy()).OrderByDescending(j => j.Created).ToList();
         }
     }
 
@@ -187,8 +187,6 @@ public sealed class JobStore
             return _jobs.Where(j => j.State == state).OrderBy(j => j.Created).Select(j => j.Id).ToList();
         }
     }
-
-    private static Job Clone(Job job) => (Job)JsonSerializer.Deserialize(JsonSerializer.Serialize(job, _json), typeof(Job), _json)!;
 
     private void Load()
     {

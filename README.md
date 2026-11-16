@@ -22,6 +22,8 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
   als auswählbare Versionen.
 - **Freigabe:** Erst mit „Freigeben“ wird das Original gelöscht, mit „Verwerfen“ die neue Datei. Ohne Entscheidung
   wird nach 14 Tagen automatisch freigegeben (einstellbar, 0 = nie).
+- **Beschädigte Quellen:** Liefert die Videospur kein lesbares Bild, scheitert der Job mit einer Klartext-Meldung.
+  Meldet ffmpeg nur stellenweise Lesefehler, wird trotzdem umgewandelt, aber mit Warnhinweis und ohne automatische Freigabe.
 - **Geprüft:** Vor dem Ablegen und noch einmal vor dem Löschen des Originals wird die neue Datei geprüft (Codec,
   Laufzeit, Anzahl der Ton- und Untertitelspuren).
 - **Unverändert übernommen:** alle Tonspuren, Untertitel, Kapitel und Metadaten. Externe Untertiteldateien werden
@@ -35,11 +37,11 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 Danach „Codec Converter“ im Katalog installieren und Jellyfin neu starten.
 
-**Von Hand:** `codec-converter_1.2.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
+**Von Hand:** `codec-converter_1.2.3.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
 
-    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.2.0.0
-    sudo unzip codec-converter_1.2.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.2.0.0
-    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.2.0.0
+    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.2.3.0
+    sudo unzip codec-converter_1.2.3.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.2.3.0
+    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.2.3.0
     sudo systemctl restart jellyfin
 
 Danach: Dashboard → Codec Converter. Auf dem Server wird nichts zusätzlich installiert, das Plugin benutzt

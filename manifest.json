@@ -8,6 +8,14 @@
     "category": "General",
     "versions": [
       {
+        "version": "1.2.3.0",
+        "changelog": "Jobs verschwinden von selbst aus der Warteschlange, wenn ihre Dateien gelöscht wurden (wartende Jobs ohne Quelldatei; Jobs vor der Freigabe, bei denen Original oder neue Datei fehlt). Solche Jobs lassen sich auch sofort von Hand entfernen. Ist die Bibliothek nicht erreichbar, bleibt die Warteschlange unverändert. Enthält die Korrekturen aus 1.2.2.0 und 1.2.1.0: Dateinamen erscheinen in Rückfragen nur noch als Text, die Umwandlung bricht ab, bevor der Datenträger voll läuft (256 MB bleiben frei), die Warteschlange bleibt auch mit Tausenden Jobs schnell, kein x265-Abbruch mehr bei mehr als 16 Threads, verständlichere Fehlermeldungen, Warnhinweis bei Lesefehlern in der Quelle.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/SunnyTeater/crispy-chicken/releases/download/v1.2.3.0/codec-converter_1.2.3.0.zip",
+        "checksum": "499b7df5fe8135e02d9345879abb09af",
+        "timestamp": "2026-11-16T08:30:00Z"
+      },
+      {
         "version": "1.2.0.0",
         "changelog": "Restzeit des laufenden Jobs und erwartete Rechenzeit der Warteschlange, berechnet aus den Fortschrittsdaten von ffmpeg. Live-Protokoll auf der Plugin-Seite.",
         "targetAbi": "12.0.0.0",

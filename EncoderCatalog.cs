@@ -379,7 +379,17 @@ public static class EncoderCatalog
 
         if (threads > 0)
         {
-            args.AddRange(new[] { "-threads", threads.ToString(System.Globalization.CultureInfo.InvariantCulture) });
+            var count = threads.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            if (job.Encoder == "libx265")
+            {
+                // x265 nimmt ueber "-threads" hoechstens 16 an und bricht bei mehr ab ("frameNumThreads must be ...").
+                // Die Groesse des Thread-Pools begrenzt die Auslastung ohne diese Obergrenze.
+                args.AddRange(new[] { "-x265-params", "pools=" + count });
+            }
+            else
+            {
+                args.AddRange(new[] { "-threads", count });
+            }
         }
 
         args.AddRange(new[] { "-max_muxing_queue_size", "4096", "-progress", "pipe:1", "-f", format, "file:" + job.TempPath });

@@ -185,14 +185,20 @@ public static class EncoderCatalog
     }
 
     /// <summary>
-    /// Schaetzt grob die Dateigroesse nach der Umwandlung.
+    /// Schaetzt die Groesse der neuen Datei. Grundlage ist das Verhaeltnis aus neuer und alter Videospur,
+    /// gemessen an echten Umwandlungen (siehe <see cref="SizeModel"/>): es haengt davon ab, wie stark die Quelle
+    /// schon komprimiert ist und welcher Qualitaetswert fuer das Ziel gewaehlt wird. Wie stark die Quelle
+    /// komprimiert ist, sagt am besten ihr eigener CRF-Wert, wenn er in der Datei steht; sonst wird er aus
+    /// Bitrate, Aufloesung und Bildrate abgeleitet. Ton, Untertitel und Anhaenge bleiben unveraendert.
+    /// Die neue Datei kann groesser werden als die alte: das wird nicht gekappt.
     /// </summary>
     /// <param name="entry">Die Quelldatei.</param>
     /// <param name="target">Der Zielcodec.</param>
     /// <param name="encoder">Der Encoder.</param>
     /// <param name="quality">Der Qualitaetswert.</param>
+    /// <param name="info">Die ausgelesenen Encoder-Angaben der Quelle, falls vorhanden.</param>
     /// <returns>Geschaetzte Groesse in Bytes.</returns>
-    public static long EstimateSize(MediaEntry entry, TargetCodec target, EncoderInfo encoder, int quality)
+    public static long EstimateSize(MediaEntry entry, TargetCodec target, EncoderInfo encoder, int quality, SourceInfo? info = null)
     {
         if (entry.Size <= 0 || entry.DurationSeconds <= 0)
         {
@@ -205,33 +211,44 @@ public static class EncoderCatalog
         var sourceVideo = entry.VideoBitrate > 0 ? Math.Min(entry.VideoBitrate, totalBitrate) : totalBitrate * 0.9;
         var other = Math.Max(0, totalBitrate - sourceVideo);
 
-        var pixels = entry.Width > 0 && entry.Height > 0 ? entry.Width * (double)entry.Height : ReferencePixels;
-        var fps = entry.Fps is > 1 and < 300 ? entry.Fps : ReferenceFps;
-
-        // Modell 1, aus Aufloesung und Bildrate: typische Bitrate des Zielcodecs.
-        // Faustregel der CRF-Encoder: 6 Stufen halbieren bzw. verdoppeln die Bitrate.
-        var typical = target.ReferenceBitrate
-            * Math.Pow(2, (target.ReferenceQuality - quality) / 6d)
-            * Math.Pow(pixels / ReferencePixels, 0.75)
-            * Math.Pow(fps / ReferenceFps, 0.5);
-
-        // Modell 2, aus der Quelle: eine hohe Quellbitrate deutet auf schwer komprimierbares Bild (Korn, Bewegung).
-        var relative = sourceVideo
-            * (Efficiency(target.Codec) / Efficiency(entry.Codec))
-            * Math.Pow(2, (target.TransparentQuality - quality) / 6d);
-
-        // Beide Modelle liegen einzeln oft daneben, ihr geometrisches Mittel trifft besser.
-        var video = Math.Sqrt(typical * relative);
-
+        var byCrf = UsesSourceCrf(entry, info);
+        var sourceLevel = byCrf ? info!.Crf!.Value : ImpliedSourceLevel(entry, sourceVideo);
+        var model = SizeModel.For(target.Codec, byCrf);
+        var ratio = Math.Pow(2, model.Offset + (model.SourceSlope * sourceLevel) - (model.TargetSlope * quality));
         if (encoder.Hardware)
         {
-            video *= HardwarePenalty;
+            ratio *= HardwarePenalty;
         }
 
-        // Aus einer bereits komprimierten Quelle wird die neue Videospur praktisch nie groesser als die alte.
-        video = Math.Min(video, sourceVideo * 0.95);
+        // Ausreisser des Modells begrenzen, aber Wachstum ausdruecklich zulassen.
+        ratio = Math.Clamp(ratio, 0.03, 4.0);
+        return (long)(((sourceVideo * ratio) + other) * entry.DurationSeconds / 8d);
+    }
 
-        return (long)((video + other) * entry.DurationSeconds / 8d);
+    /// <summary>
+    /// Ob der CRF-Wert der Quelle in die Schaetzung eingeht. Das Modell ist an x264-Quellen gemessen;
+    /// bei anderen Quellen rechnet es mit der Bitrate.
+    /// </summary>
+    /// <param name="entry">Die Quelldatei.</param>
+    /// <param name="info">Die ausgelesenen Encoder-Angaben.</param>
+    /// <returns>True, wenn der CRF-Wert benutzt wird.</returns>
+    public static bool UsesSourceCrf(MediaEntry entry, SourceInfo? info)
+        => info?.Crf is not null && info.Encoder == "x264" && entry.Codec == "h264";
+
+    /// <summary>
+    /// Leitet aus der Bitrate ab, welchem x264-Qualitaetswert die Quelle ungefaehr entspricht: eine hohe Bitrate
+    /// fuer Aufloesung und Bildrate bedeutet schwach komprimiert (kleiner Wert), eine niedrige stark komprimiert.
+    /// </summary>
+    private static double ImpliedSourceLevel(MediaEntry entry, double sourceVideo)
+    {
+        var pixels = entry.Width > 0 && entry.Height > 0 ? entry.Width * (double)entry.Height : ReferencePixels;
+        var fps = entry.Fps is > 1 and < 300 ? entry.Fps : ReferenceFps;
+        var typical = SizeModel.X264ReferenceBitrate * Math.Pow(pixels / ReferencePixels, 0.75) * Math.Pow(fps / ReferenceFps, 0.5);
+
+        // Andere Codecs brauchen fuer dieselbe Qualitaet mehr oder weniger Bitrate als H.264.
+        var asH264 = sourceVideo / Efficiency(entry.Codec);
+        var level = SizeModel.X264ReferenceLevel - (SizeModel.X264StepsPerHalving * Math.Log2(Math.Max(asH264, 1) / typical));
+        return Math.Clamp(level, 5, 45);
     }
 
     /// <summary>
@@ -431,4 +448,46 @@ public static class EncoderCatalog
                 throw new InvalidOperationException("Unbekannter Encoder.");
         }
     }
+}
+
+/// <summary>
+/// Messwerte fuer die Groessenschaetzung: log2(neue Videospur / alte Videospur) = Offset + SourceSlope * Quellwert
+/// - TargetSlope * gewaehlter Qualitaetswert. Der Quellwert ist der CRF-Wert der Quelle, wenn er in der Datei steht,
+/// sonst der aus der Bitrate abgeleitete Wert; fuer beide Faelle gibt es eigene Messwerte.
+/// Angepasst an 90 Umwandlungen von neun echten H.264-Ausschnitten (x264, CRF 18 bis 28, 404p bis 1080p) mit dem
+/// ffmpeg von Jellyfin. Mittlere Abweichung: etwa Faktor 1,3 mit CRF-Wert, etwa Faktor 1,6 nur mit Bitrate.
+/// </summary>
+/// <param name="Offset">Grundwert.</param>
+/// <param name="SourceSlope">Einfluss der Quelle: je staerker sie schon komprimiert ist, desto weniger laesst sich sparen.</param>
+/// <param name="TargetSlope">Einfluss des gewaehlten Qualitaetswerts.</param>
+public sealed record SizeModel(double Offset, double SourceSlope, double TargetSlope)
+{
+    /// <summary>Bezugs-Bitrate von x264 bei 1080p und 24 Bildern pro Sekunde fuer den abgeleiteten Quellwert.</summary>
+    public const double X264ReferenceBitrate = 4_000_000;
+
+    /// <summary>Bezugswert (CRF) zu <see cref="X264ReferenceBitrate"/>.</summary>
+    public const double X264ReferenceLevel = 23;
+
+    /// <summary>So viele Stufen des abgeleiteten Quellwerts entsprechen einer Halbierung der Bitrate.</summary>
+    public const double X264StepsPerHalving = 6;
+
+    private static readonly SizeModel _hevcCrf = new(-0.150, 0.180, 0.217);
+    private static readonly SizeModel _hevcBitrate = new(0.803, 0.114, 0.218);
+    private static readonly SizeModel _av1Crf = new(-2.151, 0.190, 0.108);
+    private static readonly SizeModel _av1Bitrate = new(-1.438, 0.134, 0.107);
+    private static readonly SizeModel _h264Crf = new(0.618, 0.141, 0.197);
+    private static readonly SizeModel _h264Bitrate = new(1.488, 0.089, 0.209);
+
+    /// <summary>
+    /// Liefert die Messwerte fuer einen Zielcodec.
+    /// </summary>
+    /// <param name="codec">Der Zielcodec.</param>
+    /// <param name="sourceCrfKnown">Ob der CRF-Wert der Quelle bekannt ist.</param>
+    /// <returns>Die Messwerte.</returns>
+    public static SizeModel For(string codec, bool sourceCrfKnown) => codec switch
+    {
+        "hevc" => sourceCrfKnown ? _hevcCrf : _hevcBitrate,
+        "av1" => sourceCrfKnown ? _av1Crf : _av1Bitrate,
+        _ => sourceCrfKnown ? _h264Crf : _h264Bitrate
+    };
 }

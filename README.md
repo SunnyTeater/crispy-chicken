@@ -7,6 +7,7 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 - **Auswahl:** nach aktuellem Codec filtern, dann Filme, ganze Serien, einzelne Staffeln oder einzelne Folgen ankreuzen.
 - **Ziel und Verlust:** Zielcodec, Encoder (CPU oder NVENC / Quick Sync / VAAPI) und Verlust-Stufe bzw. Qualitätswert (CRF) wählen.
+- **Kompression der Quelle:** zeigt Videobitrate und, soweit in der Datei vermerkt, den CRF-Wert, mit dem sie erzeugt wurde.
 - **Schätzung:** zeigt vor dem Start grob, wie groß die Auswahl danach etwa ist und wie lange die Umwandlung rechnet.
 - **Restzeit:** Beim laufenden Job aus den Fortschrittsdaten von ffmpeg (umgewandelte Laufzeit und dafür gebrauchte
   Rechenzeit), bei wartenden Jobs hochgerechnet aus früheren Jobs mit demselben Encoder. Pausen wegen aktiver Streams
@@ -37,11 +38,11 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 Danach „Codec Converter“ im Katalog installieren und Jellyfin neu starten.
 
-**Von Hand:** `codec-converter_1.2.3.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
+**Von Hand:** `codec-converter_1.2.4.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
 
-    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.2.3.0
-    sudo unzip codec-converter_1.2.3.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.2.3.0
-    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.2.3.0
+    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.2.4.0
+    sudo unzip codec-converter_1.2.4.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.2.4.0
+    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.2.4.0
     sudo systemctl restart jellyfin
 
 Danach: Dashboard → Codec Converter. Auf dem Server wird nichts zusätzlich installiert, das Plugin benutzt
@@ -71,8 +72,10 @@ das ffmpeg, das Jellyfin selbst verwendet.
   neue Version im Player auswählen.
 - Wird die Datei gerade abgespielt, lassen sich Freigeben und Verwerfen nicht ausführen.
 - Originale, die Version 1.0 in den Sicherungsordner verschoben hat, werden dort weiterhin nach Fristablauf gelöscht.
-- Die Größenschätzung ist grob. Sie rechnet aus Auflösung, Bildrate, Laufzeit, Quellbitrate und Qualitätswert und
-  kann je nach Bildinhalt (Filmkorn, viel Bewegung) deutlich danebenliegen.
+- Die Größenschätzung rechnet mit dem CRF-Wert der Quelle, wenn er in der Datei steht (nur x264/x265 schreiben ihn hinein),
+  sonst mit Bitrate, Auflösung und Bildrate. Gemessen an 90 Umwandlungen kurzer Testclips lag sie im Mittel um Faktor 1,3
+  (mit CRF-Wert) bzw. 1,6 (nur Bitrate) daneben. Ab drei eigenen Umwandlungen je Encoder gleicht sie sich mit deren Ergebnissen ab.
+  Die neue Datei kann größer werden als das Original; die Schätzung zeigt das an.
 - Mit NVENC laufen Dekodieren und Kodieren auf der Grafikkarte. Kann die Karte eine Quelle nicht dekodieren,
   folgt automatisch ein zweiter Versuch, bei dem die CPU dekodiert.
 - Hardware-Encoder werden angeboten, sobald Jellyfins ffmpeg sie enthält – das heißt nicht, dass die passende

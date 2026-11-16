@@ -26,6 +26,7 @@ public class CodecConverterController : ControllerBase
     private readonly JobStore _store;
     private readonly JobRunner _runner;
     private readonly LiveLog _log;
+    private readonly SourceInfoCache _sourceInfo;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="CodecConverterController"/> class.
@@ -34,9 +35,11 @@ public class CodecConverterController : ControllerBase
     /// <param name="store">Die Warteschlange.</param>
     /// <param name="runner">Der Job-Dienst.</param>
     /// <param name="log">Das Live-Protokoll.</param>
-    public CodecConverterController(LibraryIndex index, JobStore store, JobRunner runner, LiveLog log)
+    /// <param name="sourceInfo">Die ausgelesenen Encoder-Angaben der Quelldateien.</param>
+    public CodecConverterController(LibraryIndex index, JobStore store, JobRunner runner, LiveLog log, SourceInfoCache sourceInfo)
     {
         _log = log;
+        _sourceInfo = sourceInfo;
         _index = index;
         _store = store;
         _runner = runner;
@@ -92,6 +95,15 @@ public class CodecConverterController : ControllerBase
                 }
             }
 
+            if (_sourceInfo.TryGet(e, out var info))
+            {
+                copy.SourceRead = true;
+                copy.SourceEncoder = info.Encoder;
+                copy.SourceCrf = info.Crf;
+                copy.SourceKbps = info.TargetKbps;
+                copy.SourceQp = info.Qp;
+            }
+
             return copy;
         });
         return Ok(entries);
@@ -112,17 +124,29 @@ public class CodecConverterController : ControllerBase
         }
 
         var wanted = request.ItemIds.ToHashSet();
-        var speeds = JobRunner.BuildSpeedTable(_store.Snapshot());
+        var history = _store.Snapshot();
+        var speeds = JobRunner.BuildSpeedTable(history);
+        var correction = JobRunner.SizeCorrection(JobRunner.BuildSizeCorrections(history), encoder!.Name);
+        var chosen = _index.GetEntries(false).Where(e => wanted.Contains(e.Id) && e.Blocked is null).ToList();
+
+        // Die Encoder-Angaben der Auswahl im Hintergrund auslesen; bis dahin rechnet die Schaetzung mit der Bitrate.
+        var unread = _sourceInfo.Request(chosen);
         long source = 0;
         long estimated = 0;
         var count = 0;
+        var withCrf = 0;
+        var larger = 0;
         double seconds = 0;
         var timeKnown = true;
-        foreach (var entry in _index.GetEntries(false).Where(e => wanted.Contains(e.Id) && e.Blocked is null))
+        foreach (var entry in chosen)
         {
+            _sourceInfo.TryGet(entry, out var info);
+            var size = (long)(EncoderCatalog.EstimateSize(entry, target!, encoder!, request.Quality, info) * correction);
             source += entry.Size;
-            estimated += EncoderCatalog.EstimateSize(entry, target!, encoder!, request.Quality);
+            estimated += size;
             count++;
+            withCrf += EncoderCatalog.UsesSourceCrf(entry, info) ? 1 : 0;
+            larger += size > entry.Size ? 1 : 0;
 
             // Rechenzeit aus der Geschwindigkeit frueherer Jobs mit demselben Encoder.
             var speed = JobRunner.ExpectedSpeed(speeds, encoder!.Name, request.Speed, entry.Width, entry.Height, entry.Fps);
@@ -136,7 +160,37 @@ public class CodecConverterController : ControllerBase
             }
         }
 
-        return Ok(new { Count = count, SourceBytes = source, EstimatedBytes = estimated, EstimatedSeconds = timeKnown && count > 0 ? seconds : (double?)null });
+        return Ok(new
+        {
+            Count = count,
+            SourceBytes = source,
+            EstimatedBytes = estimated,
+            EstimatedSeconds = timeKnown && count > 0 ? seconds : (double?)null,
+
+            // Wie viele Dateien der Auswahl noch ausgelesen werden, bei wie vielen der CRF-Wert der Quelle bekannt ist,
+            // wie viele voraussichtlich groesser werden und ob eigene Ergebnisse in die Schaetzung eingehen.
+            Unread = unread,
+            WithCrf = withCrf,
+            Larger = larger,
+            Calibrated = Math.Abs(correction - 1) > 0.001
+        });
+    }
+
+    /// <summary>
+    /// Merkt Dateien zum Auslesen der Encoder-Angaben (CRF-Wert der Quelle) vor.
+    /// </summary>
+    /// <param name="request">Die Dateien; nur <see cref="ConvertRequest.ItemIds"/> wird gelesen.</param>
+    /// <returns>Wie viele davon noch nicht gelesen sind.</returns>
+    [HttpPost("SourceInfo")]
+    public ActionResult ReadSourceInfo([FromBody] ConvertRequest request)
+    {
+        if (request?.ItemIds is null || request.ItemIds.Count == 0 || request.ItemIds.Count > MaxItemsPerRequest)
+        {
+            return BadRequest(new { Message = "Ungültige Auswahl." });
+        }
+
+        var wanted = request.ItemIds.ToHashSet();
+        return Ok(new { Unread = _sourceInfo.Request(_index.GetEntries(false).Where(e => wanted.Contains(e.Id))) });
     }
 
     /// <summary>

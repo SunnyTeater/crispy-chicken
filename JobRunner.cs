@@ -66,6 +66,7 @@ public sealed class JobRunner : IHostedService, IDisposable
     private readonly Dictionary<string, string> _progressBlock = new(StringComparer.Ordinal);
     private DateTime _lastProgressLog = DateTime.MinValue;
     private bool? _lastBlocked;
+    private readonly SourceInfoCache _sourceInfo;
     private double? _currentExpectedSpeed;
     private DateTime _lastDeletedCheck = DateTime.MinValue;
     private readonly CancellationTokenSource _stopping = new();
@@ -105,9 +106,11 @@ public sealed class JobRunner : IHostedService, IDisposable
         IUserDataManager userDataManager,
         IMediaEncoder mediaEncoder,
         ILogger<JobRunner> logger,
-        LiveLog log)
+        LiveLog log,
+        SourceInfoCache sourceInfo)
     {
         _log = log;
+        _sourceInfo = sourceInfo;
         _store = store;
         _index = index;
         _libraryManager = libraryManager;
@@ -235,6 +238,37 @@ public sealed class JobRunner : IHostedService, IDisposable
     }
 
     /// <summary>
+    /// Gleicht das Rechenmodell mit den eigenen Ergebnissen ab: je Encoder das mittlere Verhaeltnis aus
+    /// tatsaechlicher und vom Modell geschaetzter Groesse der letzten Umwandlungen (Median, ab drei Ergebnissen).
+    /// </summary>
+    /// <param name="all">Alle Jobs.</param>
+    /// <returns>Korrekturfaktor je Encoder.</returns>
+    public static Dictionary<string, double> BuildSizeCorrections(IReadOnlyList<Job> all)
+    {
+        var table = new Dictionary<string, double>(StringComparer.Ordinal);
+        foreach (var group in all.Where(j => j.ModelSize > 0 && j.ResultSize > 0 && j.SourceErrors == 0).GroupBy(j => j.Encoder, StringComparer.Ordinal))
+        {
+            var ratios = group.OrderByDescending(j => j.Converted ?? j.Finished ?? j.Created).Take(15)
+                .Select(j => (double)j.ResultSize! / j.ModelSize).OrderBy(r => r).ToList();
+            if (ratios.Count >= 3)
+            {
+                table[group.Key] = Math.Clamp(ratios[ratios.Count / 2], 0.5, 2.0);
+            }
+        }
+
+        return table;
+    }
+
+    /// <summary>
+    /// Korrekturfaktor fuer einen Encoder, 1 ohne eigene Ergebnisse.
+    /// </summary>
+    /// <param name="corrections">Die Tabelle aus <see cref="BuildSizeCorrections"/>.</param>
+    /// <param name="encoder">Der Encoder.</param>
+    /// <returns>Der Faktor.</returns>
+    public static double SizeCorrection(IReadOnlyDictionary<string, double> corrections, string encoder)
+        => corrections.TryGetValue(encoder, out var factor) ? factor : 1;
+
+    /// <summary>
     /// Erwartete Geschwindigkeit (Vielfaches der Echtzeit) fuer einen Encoder bei gegebener Aufloesung.
     /// </summary>
     /// <param name="speeds">Die Tabelle aus <see cref="BuildSpeedTable"/>.</param>
@@ -343,6 +377,7 @@ public sealed class JobRunner : IHostedService, IDisposable
         var jobs = new List<Job>();
         var open = _store.OpenItemStates();
         var room = JobStore.MaxJobs - _store.Count;
+        var corrections = BuildSizeCorrections(_store.Snapshot());
 
         foreach (var id in request.ItemIds.Distinct())
         {
@@ -382,6 +417,8 @@ public sealed class JobRunner : IHostedService, IDisposable
             }
 
             var jobId = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
+            _sourceInfo.TryGet(entry, out var info);
+            var modelSize = EncoderCatalog.EstimateSize(entry, target, encoder, request.Quality, info);
             jobs.Add(new Job
             {
                 Id = jobId,
@@ -398,7 +435,9 @@ public sealed class JobRunner : IHostedService, IDisposable
                 Quality = request.Quality,
                 Speed = request.Speed,
                 SourceSize = entry.Size,
-                EstimatedSize = EncoderCatalog.EstimateSize(entry, target, encoder, request.Quality),
+                ModelSize = modelSize,
+                EstimatedSize = (long)(modelSize * SizeCorrection(corrections, encoder.Name)),
+                SourceCrf = info?.Crf,
                 DurationSeconds = entry.DurationSeconds,
                 Width = entry.Width,
                 Height = entry.Height,

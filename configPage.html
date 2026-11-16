@@ -75,6 +75,11 @@
                         <button is="emby-button" type="button" id="ccSelectAll" class="raised emby-button"><span>Alle angezeigten auswählen</span></button>
                         <button is="emby-button" type="button" id="ccSelectNone" class="raised emby-button"><span>Auswahl aufheben</span></button>
                         <button is="emby-button" type="button" id="ccReload" class="raised emby-button"><span>Bibliothek neu einlesen</span></button>
+                        <button is="emby-button" type="button" id="ccReadSource" class="raised emby-button"><span>Kompression auslesen</span></button>
+                    </div>
+                    <div class="fieldDescription">
+                        <b>Kompression auslesen:</b> liest aus den angezeigten H.264- und H.265-Dateien, mit welchem Qualitätswert (CRF) sie erzeugt wurden, und zeigt ihn in der Liste.
+                        Das steht nur in Dateien, die mit x264 oder x265 erzeugt wurden. Ausgewählte Dateien werden automatisch gelesen. <span id="ccSourceStatus"></span>
                     </div>
                 </div>
 
@@ -108,8 +113,9 @@
                     </div>
                     <div class="fieldDescription" id="ccQualityHint"></div>
                     <div class="fieldDescription">
-                        <b>Verlust / Qualitätswert:</b> Der Encoder hält die Bildqualität über den ganzen Film gleich. 6 Stufen mehr halbieren die Datei ungefähr,
-                        6 Stufen weniger verdoppeln sie. Verlorene Qualität kommt nicht zurück: ein sehr kleiner Wert macht eine schon komprimierte Quelle nicht besser, nur größer.<br>
+                        <b>Verlust / Qualitätswert:</b> Der Encoder hält die Bildqualität über den ganzen Film gleich. Bei H.264 und H.265 halbieren etwa 5 Stufen mehr die Datei,
+                        bei AV1 etwa 9. Verlorene Qualität kommt nicht zurück: ein sehr kleiner Wert macht eine schon komprimierte Quelle nicht besser, nur größer.
+                        Als Anhalt: eine mit x264 und CRF 23 erzeugte Datei wird mit H.265 erst ab etwa Qualitätswert 19 kleiner. Der CRF-Wert der Quelle steht nach dem Auslesen in der Liste.<br>
                         <b>Geschwindigkeit:</b> wie viel Rechenzeit der Encoder aufwendet. Langsam ergibt bei gleicher Qualität die kleinste Datei, Schnell die größte. Die Qualität legt der Qualitätswert fest.<br>
                         <b>Encoder:</b> Mit NVENC laufen Dekodieren und Kodieren auf der Grafikkarte. Welcher Encoder benutzt wurde, steht in der Warteschlange in der Spalte „Umwandlung“.
                     </div>
@@ -278,6 +284,63 @@
                     return names[codec] || (codec ? codec.toUpperCase() : 'unbekannt');
                 }
 
+                // Videobitrate der Quelle; ohne Angabe von Jellyfin aus Groesse und Laufzeit (dann mit Ton, deshalb "ca.").
+                function bitrateText(item) {
+                    var bits = item.VideoBitrate > 0 ? item.VideoBitrate : (item.DurationSeconds > 0 ? item.Size * 8 / item.DurationSeconds : 0);
+                    if (!bits) {
+                        return '';
+                    }
+                    var mbit = bits / 1000000;
+                    return ' · ' + (item.VideoBitrate > 0 ? '' : 'ca. ') + (mbit >= 10 ? Math.round(mbit) : mbit.toFixed(1).replace('.', ',')) + ' Mbit/s';
+                }
+
+                // Was der Encoder der Quelle in die Datei geschrieben hat: CRF-Wert, Zielbitrate oder fester Quantisierer.
+                function compressionText(item) {
+                    if (item.SourceCrf !== null && item.SourceCrf !== undefined) {
+                        return ' · CRF ' + String(Math.round(item.SourceCrf * 10) / 10).replace('.', ',');
+                    }
+                    if (item.SourceKbps) {
+                        return ' · Zielbitrate';
+                    }
+                    if (item.SourceQp !== null && item.SourceQp !== undefined) {
+                        return ' · QP ' + item.SourceQp;
+                    }
+                    return '';
+                }
+
+                function compressionTitle(item) {
+                    if (!item.SourceRead) {
+                        return 'Encoder-Angaben noch nicht ausgelesen. Sie werden gelesen, sobald die Datei ausgewählt wird, oder über „Kompression auslesen“.';
+                    }
+                    if (!item.SourceEncoder) {
+                        return 'Die Datei nennt weder Encoder noch Qualitätswert (nur x264 und x265 schreiben das hinein). Die Schätzung rechnet mit der Bitrate.';
+                    }
+                    if (item.SourceCrf !== null && item.SourceCrf !== undefined) {
+                        return 'Erzeugt mit ' + item.SourceEncoder + ', Qualitätswert (CRF) ' + item.SourceCrf + '.';
+                    }
+                    if (item.SourceKbps) {
+                        return 'Erzeugt mit ' + item.SourceEncoder + ' auf eine Zielbitrate von ' + item.SourceKbps + ' kbit/s, ohne Qualitätswert.';
+                    }
+                    return 'Erzeugt mit ' + item.SourceEncoder + '.';
+                }
+
+                var sourcePoll = null;
+                function pollSourceInfo(ids) {
+                    clearTimeout(sourcePoll);
+                    sourcePoll = setTimeout(function () {
+                        request('POST', 'SourceInfo', { ItemIds: ids }).then(function (result) {
+                            var status = $('#ccSourceStatus');
+                            if (result.Unread > 0) {
+                                status.textContent = 'Lese Kompression aus: noch ' + result.Unread + (result.Unread === 1 ? ' Datei.' : ' Dateien.');
+                                pollSourceInfo(ids);
+                                return null;
+                            }
+                            status.textContent = '';
+                            return loadItems(false).then(scheduleEstimate);
+                        }).catch(function () { $('#ccSourceStatus').textContent = ''; });
+                    }, 2000);
+                }
+
                 function selectable(item) {
                     return !item.Blocked && !item.Queued;
                 }
@@ -330,7 +393,9 @@
                         name.appendChild(el('span', 'ccTag', item.VideoRange));
                     }
                     row.appendChild(name);
-                    row.appendChild(el('span', 'ccMeta', codecLabel(item.Codec) + ' · ' + (item.Height ? item.Height + 'p' : '?') + ' · ' + size(item.Size)));
+                    var meta = el('span', 'ccMeta', codecLabel(item.Codec) + ' · ' + (item.Height ? item.Height + 'p' : '?') + bitrateText(item) + compressionText(item) + ' · ' + size(item.Size));
+                    meta.title = compressionTitle(item);
+                    row.appendChild(meta);
                     return row;
                 }
 
@@ -555,14 +620,25 @@
                             return;
                         }
                         var saved = result.SourceBytes - result.EstimatedBytes;
-                        var percent = result.SourceBytes > 0 ? Math.round(saved / result.SourceBytes * 100) : 0;
+                        var percent = result.SourceBytes > 0 ? Math.round(Math.abs(saved) / result.SourceBytes * 100) : 0;
                         var time = duration(result.EstimatedSeconds);
+                        var basis = result.WithCrf === result.Count ? 'Berechnet aus dem Qualitätswert (CRF) der Quelle und dem gewählten Qualitätswert'
+                            : result.WithCrf > 0 ? 'Berechnet aus dem Qualitätswert (CRF) der Quelle bei ' + result.WithCrf + ' von ' + result.Count + ' Dateien, sonst aus Bitrate und Auflösung'
+                            : 'Berechnet aus Bitrate und Auflösung der Quelle (kein CRF-Wert in der Datei)';
                         box.textContent = result.Count + (result.Count === 1 ? ' Datei' : ' Dateien') + ': ' + size(result.SourceBytes)
-                            + ' → ca. ' + size(result.EstimatedBytes) + ' (spart ca. ' + size(saved) + ', ' + percent + ' %). '
-                            + 'Grobe Schätzung aus Auflösung, Laufzeit und Qualitätswert, das Ergebnis kann je nach Bildinhalt deutlich abweichen. '
+                            + ' → ca. ' + size(result.EstimatedBytes)
+                            + (saved >= 0 ? ' (spart ca. ' + size(saved) + ', ' + percent + ' %). ' : ' (wird ca. ' + size(-saved) + ' größer, +' + percent + ' %). ')
+                            + (result.Larger > 0 ? (result.Larger === result.Count ? 'Mit diesem Qualitätswert wird die Datei voraussichtlich größer als das Original. '
+                                : result.Larger + ' von ' + result.Count + ' Dateien werden voraussichtlich größer als das Original. ') : '')
+                            + basis + (result.Calibrated ? ', abgeglichen mit deinen bisherigen Umwandlungen. ' : '. ')
+                            + (result.Unread > 0 ? 'Lese noch die Kompression von ' + result.Unread + (result.Unread === 1 ? ' Datei' : ' Dateien') + ' aus, die Schätzung wird danach genauer. ' : '')
+                            + 'Je nach Bildinhalt kann das Ergebnis abweichen. '
                             + (time
                                 ? 'Erwartete Rechenzeit: ' + time + ', hochgerechnet aus früheren Jobs mit diesem Encoder.'
                                 : 'Erwartete Rechenzeit: noch unbekannt, sie steht fest, sobald ein Job mit diesem Encoder und dieser Geschwindigkeit gelaufen ist.');
+                        if (result.Unread > 0) {
+                            pollSourceInfo(body.ItemIds);
+                        }
                     }).catch(function (error) {
                         if (run === estimateRun) {
                             box.textContent = error.message;
@@ -758,6 +834,20 @@
                     selected = {};
                     renderList();
                     scheduleEstimate();
+                });
+                $('#ccReadSource').addEventListener('click', function () {
+                    var ids = visibleItems().slice(0, 5000).map(function (item) { return item.Id; });
+                    if (!ids.length) {
+                        return;
+                    }
+                    request('POST', 'SourceInfo', { ItemIds: ids }).then(function (result) {
+                        if (result.Unread > 0) {
+                            $('#ccSourceStatus').textContent = 'Lese Kompression aus: noch ' + result.Unread + (result.Unread === 1 ? ' Datei.' : ' Dateien.');
+                            pollSourceInfo(ids);
+                        } else {
+                            $('#ccSourceStatus').textContent = 'Alle angezeigten Dateien sind ausgelesen.';
+                        }
+                    }).catch(showError);
                 });
                 $('#ccReload').addEventListener('click', function () {
                     Dashboard.showLoadingMsg();

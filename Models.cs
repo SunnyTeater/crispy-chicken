@@ -50,6 +50,21 @@ public sealed class MediaEntry
     /// <summary>Gets or sets den Grund, falls die Datei nicht umgewandelt werden kann.</summary>
     public string? Blocked { get; set; }
 
+    /// <summary>Gets or sets a value indicating whether die Encoder-Angaben der Datei schon ausgelesen wurden.</summary>
+    public bool SourceRead { get; set; }
+
+    /// <summary>Gets or sets den Encoder der Quelle ("x264"/"x265"), soweit die Datei ihn nennt.</summary>
+    public string? SourceEncoder { get; set; }
+
+    /// <summary>Gets or sets den CRF-Wert, mit dem die Quelle erzeugt wurde.</summary>
+    public double? SourceCrf { get; set; }
+
+    /// <summary>Gets or sets die Zielbitrate (kbit/s), mit der die Quelle erzeugt wurde.</summary>
+    public int? SourceKbps { get; set; }
+
+    /// <summary>Gets or sets den festen Quantisierer, mit dem die Quelle erzeugt wurde.</summary>
+    public int? SourceQp { get; set; }
+
     /// <summary>Gets or sets a value indicating whether bereits ein offener Job existiert.</summary>
     public bool Queued { get; set; }
 }
@@ -159,6 +174,12 @@ public sealed class Job
 
     /// <summary>Gets or sets den Gesehen-Stand der Benutzer, der nach der Freigabe noch auf die neue Datei zu uebertragen ist.</summary>
     public List<UserState> PendingUserStates { get; set; } = new();
+
+    /// <summary>Gets or sets die Schaetzung des Rechenmodells ohne den Abgleich mit frueheren Ergebnissen (0 bei alten Jobs).</summary>
+    public long ModelSize { get; set; }
+
+    /// <summary>Gets or sets den CRF-Wert der Quelle, soweit bekannt.</summary>
+    public double? SourceCrf { get; set; }
 
     /// <summary>
     /// Kopiert den Job. Die Listen werden neu angelegt, ihre Eintraege aendern sich nach dem Anlegen nicht mehr.

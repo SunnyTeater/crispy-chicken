@@ -90,6 +90,25 @@ public enum JobState
 }
 
 /// <summary>
+/// Eine Umbenennung von Original und/oder neuer Datei. Wird vor dem ersten Schritt gespeichert, damit sie
+/// nach einem Absturz zu Ende gefuehrt werden kann.
+/// </summary>
+public sealed class PendingRename
+{
+    /// <summary>Gets or sets den bisherigen Pfad des Originals (null: Original bleibt).</summary>
+    public string? OldSource { get; set; }
+
+    /// <summary>Gets or sets den neuen Pfad des Originals.</summary>
+    public string? NewSource { get; set; }
+
+    /// <summary>Gets or sets den bisherigen Pfad der neuen Datei (null: bleibt).</summary>
+    public string? OldTarget { get; set; }
+
+    /// <summary>Gets or sets den neuen Pfad der neuen Datei.</summary>
+    public string? NewTarget { get; set; }
+}
+
+/// <summary>
 /// Eine Begleitdatei (externer Untertitel), die fuer die neue Videodatei kopiert wurde.
 /// </summary>
 public sealed class SidecarCopy
@@ -181,6 +200,24 @@ public sealed class Job
     /// <summary>Gets or sets den CRF-Wert der Quelle, soweit bekannt.</summary>
     public double? SourceCrf { get; set; }
 
+    /// <summary>Gets or sets die Art des Eintrags ("Movie" oder "Episode"); null bei Jobs aus Versionen vor 1.3.</summary>
+    public string? ItemType { get; set; }
+
+    /// <summary>Gets or sets a value indicating whether neue Datei und Original nach Jellyfins Versionsregel benannt sind.</summary>
+    public bool NamingApplied { get; set; }
+
+    /// <summary>Gets or sets den Pfad des Originals, bevor das Plugin es umbenannt hat; null, wenn es nicht umbenannt wurde.</summary>
+    public string? OriginalPath { get; set; }
+
+    /// <summary>Gets or sets eine begonnene Umbenennung, die nach einem Absturz zu Ende gefuehrt wird.</summary>
+    public PendingRename? PendingRename { get; set; }
+
+    /// <summary>Gets or sets den Gesehen-Status des Originals vor dem Umbenennen, der auf den Film uebertragen wird.</summary>
+    public List<UserState> RenameUserStates { get; set; } = new();
+
+    /// <summary>Gets or sets den Zeitpunkt des Umbenennens.</summary>
+    public DateTime? RenamedAt { get; set; }
+
     /// <summary>
     /// Kopiert den Job. Die Listen werden neu angelegt, ihre Eintraege aendern sich nach dem Anlegen nicht mehr.
     /// </summary>
@@ -190,6 +227,7 @@ public sealed class Job
         var copy = (Job)MemberwiseClone();
         copy.Sidecars = new List<SidecarCopy>(Sidecars);
         copy.PendingUserStates = new List<UserState>(PendingUserStates);
+        copy.RenameUserStates = new List<UserState>(RenameUserStates);
         return copy;
     }
 }

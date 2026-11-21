@@ -31,7 +31,7 @@ public sealed record PlanResult(int Added, IReadOnlyList<string> Skipped);
 /// <summary>
 /// Arbeitet die Warteschlange ab: immer ein Job gleichzeitig und nur, solange wenig gestreamt wird.
 /// </summary>
-public sealed class JobRunner : IHostedService, IDisposable
+public sealed partial class JobRunner : IHostedService, IDisposable
 {
     /// <summary>
     /// Hinweis fuer Dateien, die schon umgewandelt sind, in Jellyfins Bibliothek aber noch mit den alten Daten stehen.
@@ -296,6 +296,8 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// </summary>
     private bool IsBeingPlayed(Job job)
     {
+        var directory = Path.GetDirectoryName(job.SourcePath);
+        bool? wholeFolder = null;
         foreach (var session in _sessionManager.Sessions)
         {
             if (session.NowPlayingItem is null)
@@ -303,8 +305,28 @@ public sealed class JobRunner : IHostedService, IDisposable
                 continue;
             }
 
-            if (session.NowPlayingItem.Id.Equals(job.ItemId)
-                || string.Equals(session.FullNowPlayingItem?.Path, job.SourcePath, StringComparison.Ordinal))
+            if (session.NowPlayingItem.Id.Equals(job.ItemId))
+            {
+                return true;
+            }
+
+            var path = session.FullNowPlayingItem?.Path;
+            if (path is null)
+            {
+                continue;
+            }
+
+            if (string.Equals(path, job.SourcePath, StringComparison.Ordinal)
+                || string.Equals(path, job.TargetPath, StringComparison.Ordinal)
+                || string.Equals(path, job.OriginalPath, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            // Bei Versionen spielt Jellyfin ueber die Hauptversion ab, die auch die andere Datei sein kann.
+            // Ein Filmordner gehoert zu genau einem Film: laeuft dort irgendetwas, gilt der Film als belegt.
+            wholeFolder ??= directory is not null && IsMovie(job) && !IsLibraryRoot(directory);
+            if (wholeFolder.Value && string.Equals(Path.GetDirectoryName(path), directory, StringComparison.Ordinal))
             {
                 return true;
             }
@@ -394,15 +416,23 @@ public sealed class JobRunner : IHostedService, IDisposable
                 reason = openState == JobState.AwaitingApproval ? AwaitingApprovalText : "bereits in der Warteschlange";
             }
 
-            // Die neue Datei kommt neben das Original und traegt den neuen Codec im Namen.
-            var container = EncoderCatalog.GetContainer(path, target.Codec);
+            // Die neue Datei kommt neben das Original und heisst nach Jellyfins Versionsregel "Ordnername-HEVC".
+            // Der endgueltige Name wird beim Fertigstellen noch einmal geprueft.
             var directory = Path.GetDirectoryName(path)!;
             var baseName = Path.GetFileNameWithoutExtension(path);
-            var targetPath = Path.Combine(directory, EncoderCatalog.BuildTargetName(baseName, target.Codec) + container.Extension);
-
-            if (reason is null && (File.Exists(targetPath) || jobs.Any(j => string.Equals(j.TargetPath, targetPath, StringComparison.Ordinal))))
+            var targetPath = string.Empty;
+            if (reason is null)
             {
-                reason = "Zieldatei " + Path.GetFileName(targetPath) + " existiert bereits";
+                try
+                {
+                    var reserved = ReservedTargets(string.Empty);
+                    reserved.UnionWith(jobs.Select(j => j.TargetPath));
+                    targetPath = PlanNames(path, entry.Codec, target.Codec, entry.Type == "Movie", null, reserved).TargetPath;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    reason = "Ordner nicht lesbar: " + ex.Message;
+                }
             }
 
             if (reason is null && jobs.Count >= room)
@@ -429,6 +459,7 @@ public sealed class JobRunner : IHostedService, IDisposable
                 // Kein Video-Dateiname: Jellyfin ignoriert die halbfertige Datei beim Scannen.
                 TempPath = Path.Combine(directory, baseName + "." + jobId[..16] + TempExtension),
                 TargetPath = targetPath,
+                ItemType = entry.Type,
                 SourceCodec = entry.Codec,
                 TargetCodec = target.Codec,
                 Encoder = encoder.Name,
@@ -516,6 +547,11 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// </summary>
     private string? FilesDeleted(Job job)
     {
+        if (job.PendingRename is not null)
+        {
+            return null;
+        }
+
         try
         {
             var sourceGone = !File.Exists(job.SourcePath);
@@ -680,6 +716,7 @@ public sealed class JobRunner : IHostedService, IDisposable
             {
                 CleanupBackups();
                 RemoveJobsOfDeletedFiles();
+                await FixNamingAsync(token).ConfigureAwait(false);
                 await AutoApproveAsync(token).ConfigureAwait(false);
                 RestoreUserStates();
 
@@ -1385,12 +1422,25 @@ public sealed class JobRunner : IHostedService, IDisposable
         });
 
         var problem = await VerifyAsync(job, job.TempPath, token).ConfigureAwait(false);
-        if (problem is null && File.Exists(job.TargetPath))
+        NamingPlan? plan = null;
+        if (problem is null)
         {
-            problem = "Die Zieldatei " + Path.GetFileName(job.TargetPath) + " existiert inzwischen.";
+            try
+            {
+                // Die Namen noch einmal pruefen: im Ordner kann sich seit dem Planen etwas geaendert haben.
+                plan = PlanNames(job.SourcePath, job.SourceCodec, job.TargetCodec, IsMovie(job), null, ReservedTargets(job.Id));
+                if (File.Exists(plan.TargetPath))
+                {
+                    problem = "Die Zieldatei " + Path.GetFileName(plan.TargetPath) + " existiert inzwischen.";
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                problem = "Der Ordner ließ sich nicht lesen: " + ex.Message;
+            }
         }
 
-        if (problem is not null)
+        if (problem is not null || plan is null)
         {
             DeleteIfExists(job.TempPath);
             Fail(job, problem + " Das Original wurde nicht angetastet.");
@@ -1405,6 +1455,9 @@ public sealed class JobRunner : IHostedService, IDisposable
                 File.SetUnixFileMode(job.TempPath, File.GetUnixFileMode(job.SourcePath));
             }
 
+            // Erst den Namen speichern, dann verschieben: nach einem Absturz findet die Wiederaufnahme die Datei.
+            _store.Update(job, j => j.TargetPath = plan.TargetPath);
+
             // Das Original bleibt, wo es ist. Die neue Datei erscheint unter ihrem endgueltigen Namen daneben.
             File.Move(job.TempPath, job.TargetPath, false);
         }
@@ -1417,18 +1470,7 @@ public sealed class JobRunner : IHostedService, IDisposable
 
         var sidecars = CopySidecars(job);
         var size = new FileInfo(job.TargetPath).Length;
-        _store.Update(job, j =>
-        {
-            j.State = JobState.AwaitingApproval;
-            j.ResultSize = size;
-            j.Finished = DateTime.UtcNow;
-            j.Converted = DateTime.UtcNow;
-            j.Sidecars = sidecars;
-            j.Message = "Neue Datei: " + Path.GetFileName(j.TargetPath) + ". Das Original bleibt bis zur Freigabe erhalten."
-                + (j.SourceErrors > 0
-                    ? " Achtung: ffmpeg meldete " + j.SourceErrors + " Fehler beim Lesen der Quelle, sie ist vermutlich stellenweise beschädigt. Bitte die neue Datei vor der Freigabe ansehen; automatisch wird sie nicht freigegeben."
-                    : string.Empty);
-        });
+
         if (job.SourceErrors > 0)
         {
             _log.Add("ACHTUNG " + job.Name + ": ffmpeg meldete " + job.SourceErrors + " Fehler beim Lesen der Quelle. Keine automatische Freigabe.");
@@ -1443,6 +1485,45 @@ public sealed class JobRunner : IHostedService, IDisposable
             size / 1048576d,
             job.SourceSize / 1048576d,
             sidecars.Count > 0 ? ", " + sidecars.Count + " Untertiteldatei(en) mitkopiert" : string.Empty));
+
+        // Freigeben oder Verwerfen erst, wenn auch das Original seinen Namen hat.
+        await _approvalLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
+        {
+            _store.Update(job, j =>
+            {
+                j.State = JobState.AwaitingApproval;
+                j.ResultSize = size;
+                j.Finished = DateTime.UtcNow;
+                j.Converted = DateTime.UtcNow;
+                j.Sidecars = sidecars;
+                j.NamingApplied = false;
+                j.Message = AwaitingMessage(j);
+            });
+
+            if (plan.OriginalNewPath is not null && IsBeingPlayed(job))
+            {
+                // Eine Datei, die gerade laeuft, nicht umbenennen. Das holt die Warteschlange nach der Wiedergabe nach.
+                _log.Add("Das Original von " + job.Name + " wird gerade abgespielt. Umbenennen nach Jellyfins Versionsregel folgt nach der Wiedergabe.");
+            }
+            else
+            {
+                try
+                {
+                    ApplyPlan(job, plan, false);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(ex, "Codec Converter: Original von {Name} konnte nicht umbenannt werden, neuer Versuch später", job.Name);
+                    _log.Add("Original von " + job.Name + " konnte nicht umbenannt werden (" + ex.Message + "), neuer Versuch später.");
+                }
+            }
+        }
+        finally
+        {
+            _approvalLock.Release();
+        }
+
 
         RefreshLibrary(job);
     }
@@ -1514,6 +1595,11 @@ public sealed class JobRunner : IHostedService, IDisposable
                 return "Die Datei wird gerade abgespielt. Bitte nach der Wiedergabe freigeben.";
             }
 
+            if (job.PendingRename is not null)
+            {
+                return "Die Dateien werden gerade umbenannt. Bitte gleich noch einmal versuchen.";
+            }
+
             if (string.Equals(Path.GetFullPath(job.SourcePath), Path.GetFullPath(job.TargetPath), StringComparison.Ordinal))
             {
                 // Darf nie vorkommen; trotzdem absichern: sonst wuerde die einzige Datei geloescht.
@@ -1530,7 +1616,7 @@ public sealed class JobRunner : IHostedService, IDisposable
                 return "Freigabe nicht möglich: " + problem + " Das Original bleibt erhalten.";
             }
 
-            var userStates = CaptureUserStates(job);
+            var userStates = CaptureUserStates(job.Name, job.SourcePath, job.TargetPath);
 
             try
             {
@@ -1550,13 +1636,8 @@ public sealed class JobRunner : IHostedService, IDisposable
                     DeleteIfExists(sidecar.Original);
                 }
 
-                // Eine NFO-Datei mit dem alten Dateinamen gehoert jetzt zur neuen Datei.
-                var oldNfo = Path.ChangeExtension(job.SourcePath, ".nfo");
-                var newNfo = Path.ChangeExtension(job.TargetPath, ".nfo");
-                if (File.Exists(oldNfo) && !File.Exists(newNfo))
-                {
-                    File.Move(oldNfo, newNfo, false);
-                }
+                // NFO, Bilder und Extras mit dem alten Dateinamen gehoeren jetzt zur neuen Datei.
+                RenameCompanions(job, job.SourcePath, job.TargetPath);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -1584,43 +1665,54 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// <summary>
     /// Merkt sich Gesehen-Status, Fortschritt und Favorit aller Benutzer fuer das Original.
     /// </summary>
-    private List<UserState> CaptureUserStates(Job job)
+    /// <summary>
+    /// Liest den Stand aus mehreren Dateien und fuehrt ihn je Benutzer zusammen. Bei Versionen haengt der Stand
+    /// an der Hauptversion, und welche Datei das ist, legt Jellyfin selbst fest.
+    /// </summary>
+    private List<UserState> CaptureUserStates(string name, params string[] paths)
     {
-        var result = new List<UserState>();
+        var result = new Dictionary<Guid, UserState>();
         try
         {
-            var oldItem = _libraryManager.FindByPath(job.SourcePath, false);
-            if (oldItem is null)
+            foreach (var path in paths.Distinct(StringComparer.Ordinal))
             {
-                return result;
-            }
-
-            foreach (var user in _userManager.GetUsers())
-            {
-                var data = _userDataManager.GetUserData(user, oldItem);
-                if (data is null || (!data.Played && !data.IsFavorite && data.PlaybackPositionTicks == 0 && data.PlayCount == 0))
+                var item = _libraryManager.FindByPath(path, false);
+                if (item is null)
                 {
                     continue;
                 }
 
-                result.Add(new UserState
+                foreach (var user in _userManager.GetUsers())
                 {
-                    UserId = user.Id,
-                    Played = data.Played,
-                    IsFavorite = data.IsFavorite,
-                    PlaybackPositionTicks = data.PlaybackPositionTicks,
-                    PlayCount = data.PlayCount,
-                    LastPlayedDate = data.LastPlayedDate
-                });
+                    var data = _userDataManager.GetUserData(user, item);
+                    if (data is null || (!data.Played && !data.IsFavorite && data.PlaybackPositionTicks == 0 && data.PlayCount == 0))
+                    {
+                        continue;
+                    }
+
+                    if (!result.TryGetValue(user.Id, out var state))
+                    {
+                        result[user.Id] = state = new UserState { UserId = user.Id };
+                    }
+
+                    state.Played |= data.Played;
+                    state.IsFavorite |= data.IsFavorite;
+                    state.PlaybackPositionTicks = Math.Max(state.PlaybackPositionTicks, data.PlaybackPositionTicks);
+                    state.PlayCount = Math.Max(state.PlayCount, data.PlayCount);
+                    if (data.LastPlayedDate > state.LastPlayedDate || state.LastPlayedDate is null)
+                    {
+                        state.LastPlayedDate = data.LastPlayedDate;
+                    }
+                }
             }
         }
         catch (Exception ex)
         {
             // Der Gesehen-Status ist kein Grund, die Freigabe scheitern zu lassen.
-            _logger.LogWarning(ex, "Codec Converter: Gesehen-Status von {Name} konnte nicht gelesen werden", job.Name);
+            _logger.LogWarning(ex, "Codec Converter: Gesehen-Status von {Name} konnte nicht gelesen werden", name);
         }
 
-        return result;
+        return result.Values.ToList();
     }
 
     /// <summary>
@@ -1635,7 +1727,8 @@ public sealed class JobRunner : IHostedService, IDisposable
         }
 
         _lastUserStateRun = DateTime.UtcNow;
-        foreach (var id in _store.IdsInState(JobState.Done))
+        RestoreRenameStates();
+        foreach (var id in _store.IdsInState(JobState.Done).Concat(_store.IdsInState(JobState.Rejected)))
         {
             var job = _store.Find(id);
             if (job is null || job.PendingUserStates.Count == 0)
@@ -1643,46 +1736,28 @@ public sealed class JobRunner : IHostedService, IDisposable
                 continue;
             }
 
+            // Freigegeben: der Stand geht auf die neue Datei. Verworfen: zurueck auf das Original.
+            var keep = job.State == JobState.Done ? job.TargetPath : job.SourcePath;
+            var gone = job.State == JobState.Done ? job.SourcePath : job.TargetPath;
             try
             {
                 if (job.Finished < DateTime.UtcNow.AddDays(-1))
                 {
-                    // Die neue Datei ist nie in der Bibliothek aufgetaucht: aufgeben.
+                    // Die Datei ist nie in der Bibliothek aufgetaucht: aufgeben.
                     _store.Update(job, j => j.PendingUserStates = new List<UserState>());
                     continue;
                 }
 
-                var newItem = _libraryManager.FindByPath(job.TargetPath, false);
-                if (newItem is null || _libraryManager.FindByPath(job.SourcePath, false) is not null)
+                var item = _libraryManager.FindByPath(keep, false);
+                if (item is null || _libraryManager.FindByPath(gone, false) is not null)
                 {
                     continue;
                 }
 
-                foreach (var state in job.PendingUserStates)
-                {
-                    var user = _userManager.GetUserById(state.UserId);
-                    if (user is null)
-                    {
-                        continue;
-                    }
-
-                    _userDataManager.SaveUserData(
-                        user,
-                        newItem,
-                        new UpdateUserItemDataDto
-                        {
-                            Played = state.Played,
-                            IsFavorite = state.IsFavorite,
-                            PlaybackPositionTicks = state.PlaybackPositionTicks,
-                            PlayCount = state.PlayCount,
-                            LastPlayedDate = state.LastPlayedDate
-                        },
-                        UserDataSaveReason.Import);
-                }
-
+                SaveUserStates(job.PendingUserStates, item);
                 _store.Update(job, j => j.PendingUserStates = new List<UserState>());
-                _logger.LogInformation("Codec Converter: Gesehen-Status von {Name} auf die neue Datei übertragen", job.Name);
-                _log.Add("Gesehen-Status von " + job.Name + " auf die neue Datei übertragen.");
+                _logger.LogInformation("Codec Converter: Gesehen-Status von {Name} auf {File} übertragen", job.Name, Path.GetFileName(keep));
+                _log.Add("Gesehen-Status von " + job.Name + " auf " + Path.GetFileName(keep) + " übertragen.");
             }
             catch (Exception ex)
             {
@@ -1719,10 +1794,18 @@ public sealed class JobRunner : IHostedService, IDisposable
                 return "Die Datei wird gerade abgespielt. Bitte nach der Wiedergabe verwerfen.";
             }
 
+            if (job.PendingRename is not null)
+            {
+                return "Die Dateien werden gerade umbenannt. Bitte gleich noch einmal versuchen.";
+            }
+
             if (!File.Exists(job.SourcePath))
             {
                 return "Das Original fehlt. Die umgewandelte Datei wird deshalb nicht gelöscht.";
             }
+
+            // War die neue Datei die Hauptversion, haengt der Gesehen-Status an ihr. Merken fuer das Original.
+            var userStates = CaptureUserStates(job.Name, job.SourcePath, job.TargetPath);
 
             try
             {
@@ -1746,7 +1829,8 @@ public sealed class JobRunner : IHostedService, IDisposable
             {
                 j.State = JobState.Rejected;
                 j.Finished = DateTime.UtcNow;
-                j.Message = "Verworfen, das Original bleibt.";
+                j.PendingUserStates = userStates;
+                j.Message = "Verworfen, das Original bleibt" + (j.OriginalPath is not null ? " (unter dem Namen " + Path.GetFileName(j.SourcePath) + ")." : ".");
             });
             _logger.LogInformation("Codec Converter: {Name} verworfen, {Path} gelöscht", job.Name, job.TargetPath);
             _log.Add("VERWORFEN " + job.Name + ": neue Datei " + Path.GetFileName(job.TargetPath) + " gelöscht, Original bleibt.");
@@ -1839,6 +1923,26 @@ public sealed class JobRunner : IHostedService, IDisposable
     /// </summary>
     private void Recover()
     {
+        foreach (var snapshot in _store.Snapshot().Where(j => j.PendingRename is not null))
+        {
+            var job = _store.Find(snapshot.Id);
+            try
+            {
+                if (job is not null)
+                {
+                    CompleteRename(job);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _logger.LogError(ex, "Codec Converter: begonnene Umbenennung von {Name} ließ sich nicht abschließen", snapshot.Name);
+                if (job is not null)
+                {
+                    _store.Update(job, j => j.Message = "Eine Umbenennung wurde durch einen Absturz unterbrochen und ließ sich nicht abschließen: " + ex.Message + " Bitte den Ordner von Hand prüfen.");
+                }
+            }
+        }
+
         foreach (var snapshot in _store.Snapshot())
         {
             var job = _store.Find(snapshot.Id);
@@ -1958,7 +2062,7 @@ public sealed class JobRunner : IHostedService, IDisposable
                 j.ResultSize = size;
                 j.Finished = DateTime.UtcNow;
                 j.Converted = DateTime.UtcNow;
-                j.Message = "Neue Datei: " + Path.GetFileName(j.TargetPath) + ". Das Original bleibt bis zur Freigabe erhalten.";
+                j.Message = AwaitingMessage(j);
             });
             return;
         }

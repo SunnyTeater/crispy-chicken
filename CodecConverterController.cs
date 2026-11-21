@@ -289,6 +289,7 @@ public class CodecConverterController : ControllerBase
                 j.Finished,
                 SourceName = Path.GetFileName(j.SourcePath),
                 TargetName = Path.GetFileName(j.TargetPath),
+                OriginalName = j.OriginalPath is null ? null : Path.GetFileName(j.OriginalPath),
 
                 // Zeitpunkt der automatischen Freigabe, falls eine Frist gesetzt ist.
                 j.SourceErrors,

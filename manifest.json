@@ -8,6 +8,14 @@
     "category": "General",
     "versions": [
       {
+        "version": "1.3.0.0",
+        "changelog": "Benennung nach Jellyfins Versionsregel: die neue Datei heißt „Ordnername-HEVC“ (ohne Leerzeichen). Passt der Name des Originals nicht zur Regel (z. B. Szene-Namen), wird es dauerhaft in „Ordnername-H264“ umbenannt, samt Untertiteln, NFO, Bildern und Extras; Gesehen-Status wird übertragen. So zeigt Jellyfin beide Dateien als Versionen eines Films. Wartende Jobs älterer Versionen werden beim ersten Start automatisch umbenannt. Beim Verwerfen bleibt der Gesehen-Status erhalten, bei der Freigabe ziehen Bilder und Extras auf die neue Datei um.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/SunnyTeater/crispy-chicken/releases/download/v1.3.0.0/codec-converter_1.3.0.0.zip",
+        "checksum": "162f09615e065fccbc354d1fae08b129",
+        "timestamp": "2026-11-21T00:00:00Z"
+      },
+      {
         "version": "1.2.4.0",
         "changelog": "Liest aus H.264- und H.265-Dateien aus, mit welchem Qualitätswert (CRF) sie erzeugt wurden, und zeigt ihn zusammen mit der Videobitrate in der Liste (Schaltfläche „Kompression auslesen“, ausgewählte Dateien automatisch). Neue Größenschätzung: rechnet mit dem CRF-Wert der Quelle, sonst mit ihrer Bitrate, zeigt auch an, wenn die Datei voraussichtlich größer wird, und gleicht sich mit den eigenen bisherigen Umwandlungen ab.",
         "targetAbi": "12.0.0.0",

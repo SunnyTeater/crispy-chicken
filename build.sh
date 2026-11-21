@@ -3,7 +3,7 @@
 # Braucht das .NET 10 SDK - nur auf dem Rechner, der baut, nicht auf dem Jellyfin-Server.
 set -e
 cd "$(dirname "$0")"
-OUT="dist/CodecConverter_1.2.4.0"
+OUT="dist/CodecConverter_1.3.0.0"
 
 dotnet publish -c Release -o "$OUT"
 

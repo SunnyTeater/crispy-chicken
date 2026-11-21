@@ -677,6 +677,9 @@
                         if (job.State === 'AwaitingApproval' || job.State === 'Done') {
                             nameCell.appendChild(el('div', 'ccSmall', 'Neu: ' + job.TargetName));
                         }
+                        if (job.OriginalName && job.State !== 'Done') {
+                            nameCell.appendChild(el('div', 'ccSmall', 'Original: ' + job.SourceName + ' (vorher ' + job.OriginalName + ')'));
+                        }
                         row.appendChild(nameCell);
                         row.appendChild(el('td', null, codecLabel(job.SourceCodec) + ' → ' + codecLabel(job.TargetCodec) + ' (' + job.Encoder + ', ' + job.Quality + ')'));
 

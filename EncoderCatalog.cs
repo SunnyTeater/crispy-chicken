@@ -269,7 +269,32 @@ public static class EncoderCatalog
         };
 
         var replaced = _codecTag.Replace(baseName, match => ReplaceTag(match.Value, targetCodec, label));
-        return string.Equals(replaced, baseName, StringComparison.Ordinal) ? baseName + " - " + label : replaced;
+        return string.Equals(replaced, baseName, StringComparison.Ordinal) ? baseName + "-" + label : replaced;
+    }
+
+    /// <summary>
+    /// Kurzname eines Codecs fuer Dateinamen und die Versionsauswahl in Jellyfin ("HEVC", "H264", ...).
+    /// Nur Buchstaben und Ziffern, damit Jellyfin den Namen weder als Extra noch als Teil eines Mehrteilers liest.
+    /// </summary>
+    /// <param name="codec">Der Codec, wie ffprobe ihn nennt.</param>
+    /// <returns>Der Kurzname.</returns>
+    public static string CodecLabel(string codec)
+    {
+        var label = codec switch
+        {
+            "hevc" => "HEVC",
+            "av1" => "AV1",
+            "h264" => "H264",
+            "mpeg2video" => "MPEG2",
+            "mpeg1video" => "MPEG1",
+            "mpeg4" or "msmpeg4v3" or "msmpeg4v2" => "MPEG4",
+            "vc1" => "VC1",
+            "wmv3" or "wmv2" or "wmv1" => "WMV",
+            "vp9" => "VP9",
+            "vp8" => "VP8",
+            _ => new string((codec ?? string.Empty).Where(char.IsAsciiLetterOrDigit).ToArray()).ToUpperInvariant()
+        };
+        return label.Length == 0 ? "VIDEO" : label;
     }
 
     private static string ReplaceTag(string tag, string targetCodec, string label)

@@ -17,10 +17,14 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 - **Warteschlange:** immer ein Job gleichzeitig, und nur solange weniger Streams aktiv sind als die Stream-Grenze
   (Standard 2, also höchstens ein laufender Stream). Wird die Grenze erreicht, hält der laufende Job an und
   macht später an derselben Stelle weiter.
-- **Ablage:** Die neue Datei wird neben das Original gelegt und trägt den neuen Codec im Namen. Steht der alte
-  Codec im Dateinamen, wird er ersetzt (`Film (2020) - 1080p x264.mkv` → `Film (2020) - 1080p x265.mkv`), sonst
-  wird er als Versionsname angehängt (`Film (2020).mkv` → `Film (2020) - HEVC.mkv`). In Jellyfin erscheinen beide
-  als auswählbare Versionen.
+- **Ablage und Benennung (Filme):** Die neue Datei kommt neben das Original und heißt nach Jellyfins Versionsregel
+  `Ordnername-Codec`, z. B. `8 Mile 2002/8 Mile 2002-HEVC.mkv`. Passt der Name des Originals nicht zur Regel
+  (etwa `dfd-8mile-1080p.mkv`), wird es dauerhaft umbenannt (`8 Mile 2002-H264.mkv`), samt Untertiteln, NFO,
+  Bildern und Extras. Gesehen-Status, Fortschritt und Favorit werden übertragen. Passt das Original schon
+  (`8 Mile 2002.mkv`, `Film (2020) - 1080p x264.mkv`), bleibt es unangetastet. In Jellyfin erscheinen beide
+  als auswählbare Versionen eines Films.
+- **Benennung (Folgen):** Jellyfin fasst Folgen nach Staffel und Folgennummer zusammen, der Name ist egal. Der
+  Codec im Namen wird ersetzt (`S01E01 x264` → `S01E01 x265`), sonst angehängt (`S01E01-HEVC`).
 - **Freigabe:** Erst mit „Freigeben“ wird das Original gelöscht, mit „Verwerfen“ die neue Datei. Ohne Entscheidung
   wird nach 14 Tagen automatisch freigegeben (einstellbar, 0 = nie).
 - **Beschädigte Quellen:** Liefert die Videospur kein lesbares Bild, scheitert der Job mit einer Klartext-Meldung.
@@ -38,11 +42,11 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 Danach „Codec Converter“ im Katalog installieren und Jellyfin neu starten.
 
-**Von Hand:** `codec-converter_1.2.4.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
+**Von Hand:** `codec-converter_1.3.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
 
-    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.2.4.0
-    sudo unzip codec-converter_1.2.4.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.2.4.0
-    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.2.4.0
+    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.3.0.0
+    sudo unzip codec-converter_1.3.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.3.0.0
+    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.3.0.0
     sudo systemctl restart jellyfin
 
 Danach: Dashboard → Codec Converter. Auf dem Server wird nichts zusätzlich installiert, das Plugin benutzt
@@ -65,9 +69,14 @@ das ffmpeg, das Jellyfin selbst verwendet.
 ## Gut zu wissen
 
 - Nach einem fertigen Job dauert es etwa eine Minute, bis Jellyfin die neue Datei als Version anzeigt.
-- Bei Filmen erkennt Jellyfin Versionen nur, wenn der Dateiname mit dem Ordnernamen beginnt und der Zusatz mit
-  ` - `, Punkt, Unterstrich oder Klammern abgetrennt ist. Sonst (z. B. `Film.2003.1080p.x264-GRP.mkv`) erscheinen
-  Original und neue Datei bis zur Freigabe als zwei getrennte Filme. Bei Folgen klappt es mit jeder Schreibweise.
+- Jellyfins Versionsregel für Filme (12.0 bis 12.4): jede Videodatei im Filmordner beginnt Zeichen für Zeichen mit
+  dem Ordnernamen, danach folgt `-`, `.`, `_` oder `[...]` (Leerzeichen davor optional). Das Plugin prüft das vor
+  jedem Umbenennen mit einem Nachbau dieser Regel.
+- Keine Versionen möglich sind, wenn der Film keinen eigenen Ordner hat oder im Ordner noch andere, nicht passende
+  Videos liegen (etwa ein zweiter Film). Dann bleibt das Original unverändert und das Live-Protokoll nennt den Grund.
+- Wartende Jobs aus Versionen vor 1.3 werden beim ersten Start automatisch nach der neuen Regel umbenannt.
+- Andere Programme, die die Dateien verwalten (z. B. Radarr), sehen das umbenannte Original erst nach einem
+  erneuten Einlesen.
 - Welche Version Jellyfin zuerst abspielt, bestimmt Jellyfin (alphabetisch bzw. nach Auflösung). Zum Prüfen die
   neue Version im Player auswählen.
 - Wird die Datei gerade abgespielt, lassen sich Freigeben und Verwerfen nicht ausführen.

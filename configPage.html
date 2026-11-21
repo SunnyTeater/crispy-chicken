@@ -41,9 +41,10 @@
                     <h2 class="sectionTitle">Codec Converter</h2>
                     <div class="fieldDescription" style="margin-bottom: 1.5em;">
                         Wandelt die Videospur von Filmen und Folgen mit ffmpeg in einen anderen Codec um. Tonspuren, Untertitel und Kapitel
-                        werden unverändert übernommen. Die neue Datei wird neben das Original gelegt und trägt den neuen Codec im Namen
-                        (aus „x264“ wird „x265“, sonst wird z. B. „ - HEVC“ angehängt). In Jellyfin lassen sich beide als Versionen auswählen.
-                        Erst mit der Freigabe wird das Original gelöscht.
+                        werden unverändert übernommen. Die neue Datei wird neben das Original gelegt und nach Jellyfins Versionsregel benannt:
+                        Filme „Ordnername-HEVC“, Folgen „Serie S01E05-HEVC“. Passt das Original nicht zu dieser Regel, wird es ebenfalls
+                        umbenannt (z. B. „Ordnername-H264“), samt Untertiteln, NFO, Bildern und Extras. So lassen sich beide in Jellyfin als
+                        Versionen auswählen. Erst mit der Freigabe wird das Original gelöscht.
                     </div>
                 </div>
 

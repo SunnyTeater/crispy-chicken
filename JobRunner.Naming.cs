@@ -19,6 +19,9 @@ namespace Jellyfin.Plugin.CodecConverter.Services;
 /// </summary>
 public sealed partial class JobRunner
 {
+    // 1: Filme nach Ordnernamen (1.3). 2: zusaetzlich Folgen nach Staffel/Folge und Fassungen im Namen (1.4).
+    private const int CurrentNamingVersion = 2;
+
     private DateTime _lastNamingRun = DateTime.MinValue;
 
     /// <summary>
@@ -31,17 +34,31 @@ public sealed partial class JobRunner
     internal sealed record NamingPlan(string TargetPath, string? OriginalNewPath, string? Note, bool Versioned);
 
     /// <summary>
+    /// Staffel und Folge laut Jellyfin.
+    /// </summary>
+    /// <param name="Season">Staffel.</param>
+    /// <param name="Number">Folge.</param>
+    /// <param name="End">Letzte Folge bei Doppelfolgen.</param>
+    /// <param name="SeriesFolder">Name des Serienordners.</param>
+    internal sealed record EpisodeNumbers(int Season, int Number, int? End, string SeriesFolder);
+
+    /// <summary>
     /// Plant die Namen von neuer Datei und Original.
     /// </summary>
     /// <param name="sourcePath">Das Original.</param>
     /// <param name="sourceCodec">Codec des Originals.</param>
     /// <param name="targetCodec">Zielcodec.</param>
     /// <param name="isMovie">Ob es ein Film ist (Folgen fasst Jellyfin nach Staffel und Folge zusammen, nicht nach Namen).</param>
+    /// <param name="episode">Staffel, Folge und Serienordner laut Jellyfin, bei Folgen.</param>
     /// <param name="ownTargetPath">Die schon vorhandene neue Datei dieses Jobs, falls umbenannt wird.</param>
     /// <param name="reserved">Pfade, die andere Jobs fuer sich vorgesehen haben.</param>
     /// <returns>Die Namen.</returns>
-    internal NamingPlan PlanNames(string sourcePath, string sourceCodec, string targetCodec, bool isMovie, string? ownTargetPath, ICollection<string> reserved)
+    internal NamingPlan PlanNames(string sourcePath, string sourceCodec, string targetCodec, bool isMovie, EpisodeNumbers? episode, string? ownTargetPath, ICollection<string> reserved)
     {
+        // Eine Fassung im Originalnamen ("Extended") bleibt in beiden Namen erhalten: "Ordner-Extended-HEVC".
+        var edition = NamingLabels.Edition(Path.GetFileNameWithoutExtension(sourcePath));
+        var sourceLabel = NamingLabels.Label(edition, sourceCodec);
+        var targetLabel = NamingLabels.Label(edition, targetCodec);
         var extension = EncoderCatalog.GetContainer(sourcePath, targetCodec).Extension;
         var directory = Path.GetDirectoryName(sourcePath)!;
         var baseName = Path.GetFileNameWithoutExtension(sourcePath);
@@ -56,7 +73,7 @@ public sealed partial class JobRunner
 
         if (!isMovie)
         {
-            return Fallback(null);
+            return PlanEpisode(sourcePath, sourceLabel, targetLabel, extension, episode, ownTargetPath, reserved, takenBySource, Fallback);
         }
 
         var folder = Path.GetFileName(directory);
@@ -89,7 +106,7 @@ public sealed partial class JobRunner
                 takenByTarget.Add(ownTargetPath);
             }
 
-            originalNewPath = FreePath(directory, folder + "-" + EncoderCatalog.CodecLabel(sourceCodec), Path.GetExtension(sourcePath), null, takenByTarget, null);
+            originalNewPath = FreePath(directory, folder + "-" + sourceLabel, Path.GetExtension(sourcePath), null, takenByTarget, null);
             originalBase = Path.GetFileNameWithoutExtension(originalNewPath);
         }
 
@@ -99,7 +116,7 @@ public sealed partial class JobRunner
             taken.Add(originalNewPath);
         }
 
-        var targetPath = FreePath(directory, folder + "-" + EncoderCatalog.CodecLabel(targetCodec), extension, ownTargetPath, taken, originalBase);
+        var targetPath = FreePath(directory, folder + "-" + targetLabel, extension, ownTargetPath, taken, originalBase);
         var names = new List<string>(others) { originalBase, Path.GetFileNameWithoutExtension(targetPath) };
         if (JellyfinNaming.WouldGroup(folder, names))
         {
@@ -110,6 +127,86 @@ public sealed partial class JobRunner
             ? "Im Ordner liegen weitere Videodateien, die nicht zum Ordnernamen passen (etwa ein anderer Film). Jellyfin kann hier keine Versionen bilden, das Original bleibt unverändert."
             : "Die Dateien im Ordner ergeben für Jellyfin unterschiedliche Jahreszahlen. Jellyfin kann hier keine Versionen bilden, das Original bleibt unverändert.");
     }
+
+    /// <summary>
+    /// Folgen: Jellyfin fasst nur Dateien zusammen, deren Namen Staffel und Folge eindeutig tragen ("S01E05", "1x05").
+    /// Traegt das Original sie, bleibt es und die neue Datei folgt seiner Schreibweise. Sonst bekommen beide den
+    /// Standard "Serienordner S01E05-H264" bzw. "-HEVC".
+    /// </summary>
+    private NamingPlan PlanEpisode(string sourcePath, string sourceLabel, string targetLabel, string extension, EpisodeNumbers? episode, string? ownTargetPath, ICollection<string> reserved, List<string> takenBySource, Func<string?, NamingPlan> fallback)
+    {
+        var directory = Path.GetDirectoryName(sourcePath)!;
+        var baseName = Path.GetFileNameWithoutExtension(sourcePath);
+        var key = EpisodeNaming.VersionKey(sourcePath);
+        if (key is not null)
+        {
+            var plan = fallback(null);
+            if (string.Equals(EpisodeNaming.VersionKey(plan.TargetPath), key, StringComparison.Ordinal))
+            {
+                return plan with { Versioned = true };
+            }
+
+            var labelled = FreePath(directory, baseName + "-" + targetLabel, extension, ownTargetPath, takenBySource, baseName);
+            return string.Equals(EpisodeNaming.VersionKey(labelled), key, StringComparison.Ordinal)
+                ? new NamingPlan(labelled, null, null, true)
+                : fallback("Jellyfin würde die neue Datei nicht als dieselbe Folge erkennen. Sie erscheint bis zur Freigabe als eigene Folge.");
+        }
+
+        if (episode is null || string.IsNullOrWhiteSpace(episode.SeriesFolder))
+        {
+            return fallback("Staffel und Folge sind unbekannt. Jellyfin kann hier keine Versionen bilden, das Original bleibt unverändert.");
+        }
+
+        var standard = episode.SeriesFolder + FormattableString.Invariant($" S{episode.Season:D2}E{episode.Number:D2}")
+            + (episode.End > episode.Number ? FormattableString.Invariant($"-E{episode.End:D2}") : string.Empty);
+        var expected = FormattableString.Invariant($"S{episode.Season}E{episode.Number}");
+        var takenByTarget = new List<string>(reserved);
+        if (ownTargetPath is not null)
+        {
+            takenByTarget.Add(ownTargetPath);
+        }
+
+        var originalNewPath = FreePath(directory, standard + "-" + sourceLabel, Path.GetExtension(sourcePath), null, takenByTarget, null);
+        var taken = new List<string>(takenBySource) { originalNewPath };
+        var targetPath = FreePath(directory, standard + "-" + targetLabel, extension, ownTargetPath, taken, Path.GetFileNameWithoutExtension(originalNewPath));
+        if (string.Equals(EpisodeNaming.VersionKey(originalNewPath), expected, StringComparison.Ordinal)
+            && string.Equals(EpisodeNaming.VersionKey(targetPath), expected, StringComparison.Ordinal))
+        {
+            return new NamingPlan(targetPath, originalNewPath, null, true);
+        }
+
+        return fallback("Für diese Folge ließ sich kein eindeutiger Name bilden. Das Original bleibt unverändert.");
+    }
+
+    /// <summary>
+    /// Staffel, Folge und Name des Serienordners laut Jellyfin, oder null.
+    /// </summary>
+    private EpisodeNumbers? EpisodeInfo(Guid itemId, string path)
+    {
+        var item = (_libraryManager.GetItemById(itemId) as Episode) ?? (_libraryManager.FindByPath(path, false) as Episode);
+        var season = item?.ParentIndexNumber ?? item?.Season?.IndexNumber;
+        if (item?.IndexNumber is not int number || season is not int s)
+        {
+            return null;
+        }
+
+        var seriesPath = item.Series?.Path;
+        string? folder;
+        if (!string.IsNullOrEmpty(seriesPath))
+        {
+            folder = Path.GetFileName(seriesPath.TrimEnd(Path.DirectorySeparatorChar));
+        }
+        else
+        {
+            var directory = Path.GetDirectoryName(path)!;
+            var name = Path.GetFileName(directory);
+            folder = _seasonFolder.IsMatch(name) ? Path.GetFileName(Path.GetDirectoryName(directory)) : name;
+        }
+
+        return new EpisodeNumbers(s, number, item.IndexNumberEnd, folder ?? string.Empty);
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex _seasonFolder = new(@"^(season|staffel|s)[ ._-]*\d+$|^specials$", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
     /// <summary>
     /// Ein freier Dateiname: base, base-2, base-3 ... Frei heisst: nicht von anderen belegt, nicht vorhanden
@@ -191,7 +288,7 @@ public sealed partial class JobRunner
         foreach (var id in _store.IdsInState(JobState.AwaitingApproval))
         {
             var snapshot = _store.Find(id);
-            if (snapshot is null || snapshot.NamingApplied)
+            if (snapshot is null || (snapshot.NamingApplied && snapshot.NamingVersion >= CurrentNamingVersion))
             {
                 continue;
             }
@@ -200,13 +297,14 @@ public sealed partial class JobRunner
             try
             {
                 var job = _store.Find(id);
-                if (job is null || job.State != JobState.AwaitingApproval || job.NamingApplied || IsBeingPlayed(job)
+                if (job is null || job.State != JobState.AwaitingApproval || (job.NamingApplied && job.NamingVersion >= CurrentNamingVersion) || IsBeingPlayed(job)
                     || !File.Exists(job.SourcePath) || !File.Exists(job.TargetPath))
                 {
                     continue;
                 }
 
-                var plan = PlanNames(job.SourcePath, job.SourceCodec, job.TargetCodec, IsMovie(job), job.TargetPath, ReservedTargets(job.Id));
+                var movie = IsMovie(job);
+                var plan = PlanNames(job.SourcePath, job.SourceCodec, job.TargetCodec, movie, movie ? null : EpisodeInfo(job.ItemId, job.SourcePath), job.TargetPath, ReservedTargets(job.Id));
                 ApplyPlan(job, plan, true);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -244,7 +342,11 @@ public sealed partial class JobRunner
 
         if (rename.NewSource is null && rename.NewTarget is null)
         {
-            _store.Update(job, j => j.NamingApplied = true);
+            _store.Update(job, j =>
+            {
+                j.NamingApplied = true;
+                j.NamingVersion = CurrentNamingVersion;
+            });
             if (plan.Note is not null)
             {
                 _log.Add("Benennung " + job.Name + ": " + plan.Note);
@@ -325,6 +427,7 @@ public sealed partial class JobRunner
         {
             j.PendingRename = null;
             j.NamingApplied = true;
+            j.NamingVersion = CurrentNamingVersion;
             if (j.State == JobState.AwaitingApproval)
             {
                 j.Message = AwaitingMessage(j);
@@ -332,7 +435,7 @@ public sealed partial class JobRunner
         });
 
         _logger.LogInformation("Codec Converter: {Name} nach Jellyfins Versionsregel umbenannt: {Notes}", job.Name, string.Join("; ", notes));
-        _log.Add("UMBENANNT " + job.Name + ": " + string.Join("; ", notes) + ". Jellyfin zeigt beide als Versionen eines Films.");
+        _log.Add("UMBENANNT " + job.Name + ": " + string.Join("; ", notes) + ". Jellyfin zeigt beide als Versionen.");
         try
         {
             _index.Invalidate();

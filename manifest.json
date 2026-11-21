@@ -3,10 +3,18 @@
     "guid": "7b738b42-d885-4a24-8312-97bdd0e0e32f",
     "name": "Codec Converter",
     "overview": "Wandelt Filme und Folgen per ffmpeg in einen anderen Videocodec um",
-    "description": "Filme, Serien, Staffeln oder Folgen nach Codec filtern und in H.265, AV1 oder H.264 umwandeln. Mit Größenschätzung, Warteschlange und Pause bei aktiven Streams. Originale werden gesichert.",
+    "description": "Filme, Serien, Staffeln oder Folgen nach Codec filtern und in H.265, AV1 oder H.264 umwandeln. Mit Größenschätzung, Warteschlange und Pause bei aktiven Streams. Benennung nach Jellyfins Versionsregel, das Original bleibt bis zur Freigabe erhalten.",
     "owner": "SunnyTeater",
     "category": "General",
     "versions": [
+      {
+        "version": "1.4.0.0",
+        "changelog": "Folgen werden nach Jellyfins Regel benannt: Trägt das Original Staffel und Folge nicht eindeutig im Namen (z. B. „05 - Titel.mkv“), heißen Original und neue Datei „Serie S01E05-H264“ / „-HEVC“, sodass Jellyfin beide als Versionen zeigt. Fassungen im Namen (Extended, Director's Cut …) bleiben erhalten („Ordner-Extended-HEVC“). Wartende Jobs werden beim ersten Start umgestellt. Einleitungstext auf der Plugin-Seite korrigiert. Gleiche Regeln wie im Plugin „Naming Standardizer“.",
+        "targetAbi": "12.0.0.0",
+        "sourceUrl": "https://github.com/SunnyTeater/crispy-chicken/releases/download/v1.4.0.0/codec-converter_1.4.0.0.zip",
+        "checksum": "6d2d7940721a68df7a43a8c710cf6949",
+        "timestamp": "2026-11-21T12:00:00Z"
+      },
       {
         "version": "1.3.0.0",
         "changelog": "Benennung nach Jellyfins Versionsregel: die neue Datei heißt „Ordnername-HEVC“ (ohne Leerzeichen). Passt der Name des Originals nicht zur Regel (z. B. Szene-Namen), wird es dauerhaft in „Ordnername-H264“ umbenannt, samt Untertiteln, NFO, Bildern und Extras; Gesehen-Status wird übertragen. So zeigt Jellyfin beide Dateien als Versionen eines Films. Wartende Jobs älterer Versionen werden beim ersten Start automatisch umbenannt. Beim Verwerfen bleibt der Gesehen-Status erhalten, bei der Freigabe ziehen Bilder und Extras auf die neue Datei um.",

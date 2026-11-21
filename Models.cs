@@ -206,6 +206,9 @@ public sealed class Job
     /// <summary>Gets or sets a value indicating whether neue Datei und Original nach Jellyfins Versionsregel benannt sind.</summary>
     public bool NamingApplied { get; set; }
 
+    /// <summary>Gets or sets den Stand der Benennungsregel, nach der zuletzt benannt wurde (0 = vor 1.4).</summary>
+    public int NamingVersion { get; set; }
+
     /// <summary>Gets or sets den Pfad des Originals, bevor das Plugin es umbenannt hat; null, wenn es nicht umbenannt wurde.</summary>
     public string? OriginalPath { get; set; }
 

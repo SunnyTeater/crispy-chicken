@@ -23,8 +23,12 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
   Bildern und Extras. Gesehen-Status, Fortschritt und Favorit werden übertragen. Passt das Original schon
   (`8 Mile 2002.mkv`, `Film (2020) - 1080p x264.mkv`), bleibt es unangetastet. In Jellyfin erscheinen beide
   als auswählbare Versionen eines Films.
-- **Benennung (Folgen):** Jellyfin fasst Folgen nach Staffel und Folgennummer zusammen, der Name ist egal. Der
-  Codec im Namen wird ersetzt (`S01E01 x264` → `S01E01 x265`), sonst angehängt (`S01E01-HEVC`).
+- **Benennung (Folgen):** Jellyfin fasst Folgen nur zusammen, wenn Staffel und Folge eindeutig im Namen stehen
+  (`S01E05`, `1x05`). Dann bleibt das Original und die neue Datei folgt seiner Schreibweise (`S01E05 x264` →
+  `S01E05 x265`, sonst `S01E05-HEVC`). Fehlt das (z. B. `05 - Titel.mkv`), werden beide nach Standard benannt:
+  `Serie S01E05-H264.mkv` und `Serie S01E05-HEVC.mkv`.
+- **Fassungen:** Steht eine Fassung im Originalnamen (Extended, Director's Cut, Unrated, Remastered …), bleibt sie
+  in beiden Namen erhalten: `Film 2011-Extended-H264.mkv` / `Film 2011-Extended-HEVC.mkv`.
 - **Freigabe:** Erst mit „Freigeben“ wird das Original gelöscht, mit „Verwerfen“ die neue Datei. Ohne Entscheidung
   wird nach 14 Tagen automatisch freigegeben (einstellbar, 0 = nie).
 - **Beschädigte Quellen:** Liefert die Videospur kein lesbares Bild, scheitert der Job mit einer Klartext-Meldung.
@@ -42,11 +46,11 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 Danach „Codec Converter“ im Katalog installieren und Jellyfin neu starten.
 
-**Von Hand:** `codec-converter_1.3.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
+**Von Hand:** `codec-converter_1.4.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
 
-    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.3.0.0
-    sudo unzip codec-converter_1.3.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.3.0.0
-    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.3.0.0
+    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.4.0.0
+    sudo unzip codec-converter_1.4.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.4.0.0
+    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.4.0.0
     sudo systemctl restart jellyfin
 
 Danach: Dashboard → Codec Converter. Auf dem Server wird nichts zusätzlich installiert, das Plugin benutzt
@@ -74,7 +78,8 @@ das ffmpeg, das Jellyfin selbst verwendet.
   jedem Umbenennen mit einem Nachbau dieser Regel.
 - Keine Versionen möglich sind, wenn der Film keinen eigenen Ordner hat oder im Ordner noch andere, nicht passende
   Videos liegen (etwa ein zweiter Film). Dann bleibt das Original unverändert und das Live-Protokoll nennt den Grund.
-- Wartende Jobs aus Versionen vor 1.3 werden beim ersten Start automatisch nach der neuen Regel umbenannt.
+- Wartende Jobs aus älteren Versionen werden beim ersten Start automatisch nach der aktuellen Regel umbenannt.
+- Dieselben Regeln nutzt das Plugin „Naming Standardizer“, das bestehende Dateien der ganzen Bibliothek angleicht.
 - Andere Programme, die die Dateien verwalten (z. B. Radarr), sehen das umbenannte Original erst nach einem
   erneuten Einlesen.
 - Welche Version Jellyfin zuerst abspielt, bestimmt Jellyfin (alphabetisch bzw. nach Auflösung). Zum Prüfen die

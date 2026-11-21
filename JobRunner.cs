@@ -427,7 +427,8 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 {
                     var reserved = ReservedTargets(string.Empty);
                     reserved.UnionWith(jobs.Select(j => j.TargetPath));
-                    targetPath = PlanNames(path, entry.Codec, target.Codec, entry.Type == "Movie", null, reserved).TargetPath;
+                    var movie = entry.Type == "Movie";
+                    targetPath = PlanNames(path, entry.Codec, target.Codec, movie, movie ? null : EpisodeInfo(id, path), null, reserved).TargetPath;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -1428,7 +1429,8 @@ public sealed partial class JobRunner : IHostedService, IDisposable
             try
             {
                 // Die Namen noch einmal pruefen: im Ordner kann sich seit dem Planen etwas geaendert haben.
-                plan = PlanNames(job.SourcePath, job.SourceCodec, job.TargetCodec, IsMovie(job), null, ReservedTargets(job.Id));
+                var movie = IsMovie(job);
+                plan = PlanNames(job.SourcePath, job.SourceCodec, job.TargetCodec, movie, movie ? null : EpisodeInfo(job.ItemId, job.SourcePath), null, ReservedTargets(job.Id));
                 if (File.Exists(plan.TargetPath))
                 {
                     problem = "Die Zieldatei " + Path.GetFileName(plan.TargetPath) + " existiert inzwischen.";
@@ -1498,6 +1500,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 j.Converted = DateTime.UtcNow;
                 j.Sidecars = sidecars;
                 j.NamingApplied = false;
+                j.NamingVersion = 0;
                 j.Message = AwaitingMessage(j);
             });
 

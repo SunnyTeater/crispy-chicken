@@ -223,6 +223,7 @@ public class CodecConverterController : ControllerBase
     public ActionResult GetJobs()
     {
         var all = _store.Snapshot();
+        var running = all.Count(j => j.State is JobState.Running or JobState.Paused);
         var speeds = JobRunner.BuildSpeedTable(all);
         var etas = new Dictionary<string, double?>(all.Count);
         double queueSeconds = 0;
@@ -264,7 +265,9 @@ public class CodecConverterController : ControllerBase
             _runner.IsBlocked,
 
             // Restliche Rechenzeit der ganzen Warteschlange; null, solange fuer einen Job noch kein Erfahrungswert da ist.
-            QueueEtaSeconds = pendingCount > 0 && queueKnown ? queueSeconds : (double?)null,
+            // Laufen mehrere Jobs gleichzeitig, verteilt sie sich ungefaehr auf diese.
+            QueueEtaSeconds = pendingCount > 0 && queueKnown ? queueSeconds / Math.Max(1, running) : (double?)null,
+            Parallel = _runner.ParallelStatus(),
             Total = all.Count,
             OpenCount = all.Count(j => j.State is JobState.Queued or JobState.Running or JobState.Paused or JobState.Finalizing),
             AwaitingCount = all.Count(j => j.State == JobState.AwaitingApproval),

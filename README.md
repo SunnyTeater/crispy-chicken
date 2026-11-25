@@ -14,13 +14,20 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
   zählen nicht mit.
 - **Live-Protokoll:** zeigt auf der Plugin-Seite den ffmpeg-Aufruf, alle paar Sekunden den Fortschritt, Pausen,
   Prüfung und Freigabe.
-- **Warteschlange:** immer ein Job gleichzeitig, und nur solange weniger Streams aktiv sind als die Stream-Grenze
-  (Standard 2, also höchstens ein laufender Stream). Wird die Grenze erreicht, hält der laufende Job an und
-  macht später an derselben Stelle weiter.
+- **Warteschlange:** Jobs laufen nur, solange weniger Streams aktiv sind als die Stream-Grenze (Standard 2, also
+  höchstens ein laufender Stream). Wird die Grenze erreicht, halten alle laufenden Jobs an und machen später an
+  derselben Stelle weiter.
+- **Mehrere Jobs gleichzeitig (ab 1.5.0.0):** Ein einzelner x265-Job lastet viele Kerne nicht aus (bei 1080p rechnet
+  x265 nur an wenigen Bildzeilen und Bildern gleichzeitig). In der Einstellung „Gleichzeitige Jobs“ = 0 (automatisch)
+  erkennt das Plugin die Threads des Servers, misst die Auslastung und startet einen weiteren Job, wenn genug Threads
+  und Arbeitsspeicher frei sind. Danach misst es, ob der Durchsatz wirklich steigt: Lohnt sich ein weiterer Job nicht
+  (unter 8 % mehr), bleibt es zwei Stunden bei weniger Jobs. Was sich bewährt hat, startet beim nächsten freien Platz
+  sofort. Andere Last auf dem Server (Streams, Transkodierung) zählt unter Linux mit. Hardware-Encoder
+  laufen automatisch nur einzeln. 1 = immer nur ein Job, 2 und mehr = feste Anzahl.
 - **Ablage und Benennung (Filme):** Die neue Datei kommt neben das Original und heißt nach Jellyfins Versionsregel
   `Ordnername-Codec`, z. B. `8 Mile 2002/8 Mile 2002-HEVC.mkv`. Passt der Name des Originals nicht zur Regel
   (etwa `dfd-8mile-1080p.mkv`), wird es dauerhaft umbenannt (`8 Mile 2002-H264.mkv`), samt Untertiteln, NFO,
-  Bildern und Extras. Gesehen-Status, Fortschritt und Favorit werden übertragen. Passt das Original schon
+  Bildern und Extras. Gesehen-Status, Fortschritt, Favorit sowie Playlist- und Sammlungseinträge werden übertragen. Passt das Original schon
   (`8 Mile 2002.mkv`, `Film (2020) - 1080p x264.mkv`), bleibt es unangetastet. In Jellyfin erscheinen beide
   als auswählbare Versionen eines Films.
 - **Benennung (Folgen):** Jellyfin fasst Folgen nur zusammen, wenn Staffel und Folge eindeutig im Namen stehen
@@ -37,6 +44,9 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
   Laufzeit, Anzahl der Ton- und Untertitelspuren).
 - **Unverändert übernommen:** alle Tonspuren, Untertitel, Kapitel und Metadaten. Externe Untertiteldateien werden
   für die neue Datei mitkopiert, der Gesehen-Status wird bei der Freigabe übertragen.
+- **Playlists und Sammlungen:** Wird das Original umbenannt, freigegeben oder verworfen, bleibt der Film bzw. die
+  Folge in allen Playlists (an derselben Stelle) und Sammlungen. Das passiert, sobald Jellyfin die Bibliothek neu
+  eingelesen hat, und klappt auch nach einem Neustart von Jellyfin.
 
 ## Installieren
 
@@ -46,11 +56,11 @@ anderen Codec umwandelt (H.265/HEVC, AV1 oder H.264).
 
 Danach „Codec Converter“ im Katalog installieren und Jellyfin neu starten.
 
-**Von Hand:** `codec-converter_1.4.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
+**Von Hand:** `codec-converter_1.5.0.0.zip` aus den Releases laden, in den Plugin-Ordner entpacken und Jellyfin neu starten:
 
-    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.4.0.0
-    sudo unzip codec-converter_1.4.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.4.0.0
-    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.4.0.0
+    sudo mkdir -p /var/lib/jellyfin/plugins/CodecConverter_1.5.0.0
+    sudo unzip codec-converter_1.5.0.0.zip -d /var/lib/jellyfin/plugins/CodecConverter_1.5.0.0
+    sudo chown -R jellyfin: /var/lib/jellyfin/plugins/CodecConverter_1.5.0.0
     sudo systemctl restart jellyfin
 
 Danach: Dashboard → Codec Converter. Auf dem Server wird nichts zusätzlich installiert, das Plugin benutzt

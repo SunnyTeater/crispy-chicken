@@ -34,6 +34,12 @@ public class PluginConfiguration : BasePluginConfiguration
     public int Threads { get; set; }
 
     /// <summary>
+    /// Gets or sets, wie viele Jobs gleichzeitig laufen. 0 = automatisch: das Plugin misst die Auslastung und startet
+    /// weitere Jobs, solange Threads frei sind und sich der Durchsatz dadurch erhoeht.
+    /// </summary>
+    public int ParallelJobs { get; set; }
+
+    /// <summary>
     /// Gets or sets das VAAPI-Geraet fuer die VAAPI-Encoder.
     /// </summary>
     public string VaapiDevice { get; set; } = "/dev/dri/renderD128";

@@ -91,11 +91,18 @@ public sealed class JobStore
     /// Liefert den aeltesten wartenden Job (das Original, keine Kopie).
     /// </summary>
     /// <returns>Der Job oder null.</returns>
-    public Job? NextQueued()
+    public Job? NextQueued() => NextQueued(_ => true);
+
+    /// <summary>
+    /// Liefert den aeltesten wartenden Job, der die Bedingung erfuellt.
+    /// </summary>
+    /// <param name="include">Bedingung (etwa: laeuft noch nicht an).</param>
+    /// <returns>Der Job oder null.</returns>
+    public Job? NextQueued(Func<Job, bool> include)
     {
         lock (_lock)
         {
-            return _jobs.Where(j => j.State == JobState.Queued).OrderBy(j => j.Created).FirstOrDefault();
+            return _jobs.Where(j => j.State == JobState.Queued && include(j)).OrderBy(j => j.Created).FirstOrDefault();
         }
     }
 

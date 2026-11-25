@@ -218,6 +218,12 @@ public sealed class Job
     /// <summary>Gets or sets den Gesehen-Status des Originals vor dem Umbenennen, der auf den Film uebertragen wird.</summary>
     public List<UserState> RenameUserStates { get; set; } = new();
 
+    /// <summary>Gets or sets die Verweise aus Playlists und Sammlungen auf das Original vor dem Umbenennen.</summary>
+    public List<LinkEntry> RenameLinks { get; set; } = new();
+
+    /// <summary>Gets or sets die Verweise aus Playlists und Sammlungen, die nach Freigabe/Verwerfen uebertragen werden.</summary>
+    public List<LinkEntry> PendingLinks { get; set; } = new();
+
     /// <summary>Gets or sets den Zeitpunkt des Umbenennens.</summary>
     public DateTime? RenamedAt { get; set; }
 
@@ -231,6 +237,8 @@ public sealed class Job
         copy.Sidecars = new List<SidecarCopy>(Sidecars);
         copy.PendingUserStates = new List<UserState>(PendingUserStates);
         copy.RenameUserStates = new List<UserState>(RenameUserStates);
+        copy.RenameLinks = new List<LinkEntry>(RenameLinks);
+        copy.PendingLinks = new List<LinkEntry>(PendingLinks);
         return copy;
     }
 }

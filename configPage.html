@@ -151,7 +151,7 @@
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="ccStreamLimit">Stream-Grenze</label>
                         <input is="emby-input" id="ccStreamLimit" type="number" min="1" max="1000" step="1" />
-                        <div class="fieldDescription">Jobs laufen nur, solange weniger Streams als dieser Wert aktiv sind. Bei 2 darf höchstens ein Stream laufen. Wird die Grenze erreicht, hält der laufende Job an und macht später weiter.</div>
+                        <div class="fieldDescription">Jobs laufen nur, solange weniger Streams als dieser Wert aktiv sind. Bei 2 darf höchstens ein Stream laufen. Wird die Grenze erreicht, halten alle laufenden Jobs an und machen später an derselben Stelle weiter.</div>
                     </div>
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="ccAutoApprove">Automatische Freigabe nach (Tagen)</label>
@@ -159,9 +159,14 @@
                         <div class="fieldDescription">So lange nach der Umwandlung wird das Original automatisch gelöscht, wenn es bis dahin niemand freigegeben oder verworfen hat. 0 = nie automatisch, nur von Hand.</div>
                     </div>
                     <div class="inputContainer">
+                        <label class="inputLabel inputLabelUnfocused" for="ccParallel">Gleichzeitige Jobs</label>
+                        <input is="emby-input" id="ccParallel" type="number" min="0" max="32" step="1" />
+                        <div class="fieldDescription">0 = automatisch: Das Plugin misst die Auslastung aller Threads des Servers und startet einen weiteren Job, wenn genug Threads und Arbeitsspeicher frei sind. Danach prüft es, ob der Durchsatz wirklich steigt, und bleibt sonst bei weniger Jobs. Hardware-Encoder laufen automatisch nur einzeln. 1 = immer nur ein Job, 2 und mehr = feste Anzahl.</div>
+                    </div>
+                    <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="ccThreads">ffmpeg-Threads</label>
                         <input is="emby-input" id="ccThreads" type="number" min="0" max="256" step="1" />
-                        <div class="fieldDescription">0 = automatisch (alle Kerne). Ein kleinerer Wert lässt dem Server mehr Luft.</div>
+                        <div class="fieldDescription">Threads je Job. 0 = automatisch (alle Kerne). Ein kleinerer Wert lässt dem Server mehr Luft.</div>
                     </div>
                     <div class="inputContainer">
                         <label class="inputLabel inputLabelUnfocused" for="ccVaapi">VAAPI-Gerät</label>
@@ -654,8 +659,18 @@
                     var open = result.OpenCount;
                     var awaiting = result.AwaitingCount;
                     status.className = 'ccStatus' + (result.IsBlocked ? ' ccBlocked' : '');
+                    var par = result.Parallel || {};
+                    var parText = par.Threads ? 'Server: ' + par.Threads + ' Threads'
+                        + (par.CpuPercent !== null && par.CpuPercent !== undefined ? ', ausgelastet ' + par.CpuPercent + ' %' : '')
+                        + (par.Running > 0 && par.JobThreads ? ' (Jobs: ' + par.JobThreads.toLocaleString('de-DE') + ' Threads)' : '')
+                        + '. Gleichzeitig: ' + par.Running + (par.Automatic
+                            ? ' (automatisch' + (par.Proven ? ', bewährt: ' + par.Proven : '') + (par.Learned ? ', mehr als ' + par.Limit + ' lohnt sich nicht' : '') + ')'
+                            : ' von ' + par.Limit)
+                        + (par.Decision && par.Running > 0 && open > par.Running ? ', kein weiterer Job: ' + par.Decision : '')
+                        + '. ' : '';
                     status.textContent = 'Aktive Streams: ' + result.ActiveStreams + ' (Jobs laufen bei weniger als ' + result.StreamLimit + '). '
                         + (result.IsBlocked ? 'Die Umwandlung pausiert gerade. ' : '')
+                        + parText
                         + 'Offene Jobs: ' + open + (open && duration(result.QueueEtaSeconds) ? ' (restliche Rechenzeit ' + duration(result.QueueEtaSeconds) + ')' : '')
                         + '. Warten auf Freigabe: ' + awaiting + '.'
                         + (result.Total > result.Jobs.length ? ' Angezeigt werden ' + result.Jobs.length + ' von ' + result.Total + ' Jobs.' : '');
@@ -796,6 +811,7 @@
                         $('#ccStreamLimit').value = config.StreamLimit;
                         $('#ccAutoApprove').value = config.AutoApproveDays;
                         $('#ccThreads').value = config.Threads;
+                        $('#ccParallel').value = config.ParallelJobs || 0;
                         $('#ccVaapi').value = config.VaapiDevice || '';
                     });
                 }
@@ -918,6 +934,7 @@
                         config.StreamLimit = Math.max(1, parseInt($('#ccStreamLimit').value, 10) || 2);
                         config.AutoApproveDays = Math.max(0, parseInt($('#ccAutoApprove').value, 10) || 0);
                         config.Threads = Math.max(0, parseInt($('#ccThreads').value, 10) || 0);
+                        config.ParallelJobs = Math.min(32, Math.max(0, parseInt($('#ccParallel').value, 10) || 0));
                         config.VaapiDevice = $('#ccVaapi').value.trim();
                         return ApiClient.updatePluginConfiguration(pluginId, config);
                     }).then(function (result) {

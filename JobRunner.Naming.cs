@@ -183,7 +183,7 @@ public sealed partial class JobRunner
     /// </summary>
     private EpisodeNumbers? EpisodeInfo(Guid itemId, string path)
     {
-        var item = (_libraryManager.GetItemById(itemId) as Episode) ?? (_libraryManager.FindByPath(path, false) as Episode);
+        var item = (_libraryManager.GetItemById(itemId) as Episode) ?? (LinkKeeper.FindItem(_libraryManager, path) as Episode);
         var season = item?.ParentIndexNumber ?? item?.Season?.IndexNumber;
         if (item?.IndexNumber is not int number || season is not int s)
         {
@@ -249,7 +249,7 @@ public sealed partial class JobRunner
             return job.ItemType == "Movie";
         }
 
-        var item = _libraryManager.GetItemById(job.ItemId) ?? _libraryManager.FindByPath(job.SourcePath, false);
+        var item = _libraryManager.GetItemById(job.ItemId) ?? LinkKeeper.FindItem(_libraryManager, job.SourcePath);
         var type = item switch
         {
             Movie => "Movie",
@@ -355,11 +355,20 @@ public sealed partial class JobRunner
             return;
         }
 
-        if (rename.NewSource is not null && job.RenameUserStates.Count == 0)
+        if (rename.NewSource is not null && job.RenameUserStates.Count == 0 && job.RenameLinks.Count == 0)
         {
-            // Der Gesehen-Status haengt an der alten Datei. Merken, bevor Jellyfin sie unter neuem Namen neu anlegt.
+            // Gesehen-Status und Verweise aus Playlists/Sammlungen haengen an der alten Datei. Merken, bevor Jellyfin
+            // sie unter neuem Namen neu anlegt.
             var states = CaptureUserStates(job.Name, job.SourcePath);
-            _store.Update(job, j => j.RenameUserStates = states, persist: false);
+            var links = _links.Capture(new[] { job.SourcePath });
+            _store.Update(
+                job,
+                j =>
+                {
+                    j.RenameUserStates = states;
+                    j.RenameLinks = links;
+                },
+                persist: false);
         }
 
         _store.Update(job, j => j.PendingRename = rename);
@@ -540,12 +549,15 @@ public sealed partial class JobRunner
                 : string.Empty);
 
     /// <summary>
-    /// Uebertraegt den Gesehen-Status des umbenannten Originals auf den Film, sobald Jellyfin die Datei unter
-    /// neuem Namen eingelesen hat.
+    /// Uebertraegt Gesehen-Status, Playlist- und Sammlungseintraege des umbenannten Originals, sobald Jellyfin
+    /// die Datei unter neuem Namen eingelesen hat.
     /// </summary>
-    private void RestoreRenameStates()
+    /// <param name="pending">Alte Eintraege, deren Verweise noch warten.</param>
+    /// <returns>True, wenn sich etwas getan hat.</returns>
+    private bool RestoreRenameStates(ISet<Guid> pending)
     {
-        foreach (var snapshot in _store.Snapshot().Where(j => j.RenameUserStates.Count > 0 && j.PendingRename is null && j.OriginalPath is not null))
+        var progress = false;
+        foreach (var snapshot in _store.Snapshot().Where(j => (j.RenameUserStates.Count > 0 || j.RenameLinks.Count > 0) && j.PendingRename is null && j.OriginalPath is not null))
         {
             var job = _store.Find(snapshot.Id);
             if (job is null)
@@ -557,44 +569,98 @@ public sealed partial class JobRunner
             {
                 if ((job.RenamedAt ?? DateTime.MinValue) < DateTime.UtcNow.AddDays(-1))
                 {
-                    _store.Update(job, j => j.RenameUserStates = new List<UserState>());
+                    ClearRenameTransfer(job);
+                    progress = true;
                     continue;
                 }
 
-                if (_libraryManager.FindByPath(job.OriginalPath!, false) is not null)
+                if (LinkKeeper.FindItem(_libraryManager, job.OriginalPath!) is not null)
                 {
                     continue;
                 }
 
                 // Nach einer Freigabe ist das Original schon weg: dann bekommt die neue Datei den Stand.
-                var item = _libraryManager.FindByPath(job.SourcePath, false) ?? _libraryManager.FindByPath(job.TargetPath, false);
+                var item = LinkKeeper.FindItem(_libraryManager, job.SourcePath) ?? LinkKeeper.FindItem(_libraryManager, job.TargetPath);
                 if (item is null)
                 {
                     continue;
                 }
 
-                var targets = new List<BaseItem> { item };
-                if (item is Video video && video.PrimaryVersionId.HasValue && _libraryManager.GetItemById(video.PrimaryVersionId.Value) is { } primary)
+                if (job.RenameUserStates.Count > 0)
                 {
-                    // Jellyfin zeigt den Film mit der Hauptversion an; der Gesehen-Status gehoert dorthin.
-                    targets.Add(primary);
+                    var targets = new List<BaseItem> { item };
+                    if (item is Video video && video.PrimaryVersionId.HasValue && _libraryManager.GetItemById(video.PrimaryVersionId.Value) is { } primary)
+                    {
+                        // Jellyfin zeigt den Film mit der Hauptversion an; der Gesehen-Status gehoert dorthin.
+                        targets.Add(primary);
+                    }
+
+                    foreach (var target in targets)
+                    {
+                        SaveUserStates(job.RenameUserStates, target);
+                    }
+
+                    _store.Update(job, j => j.RenameUserStates = new List<UserState>());
+                    _log.Add("Nach dem Umbenennen übertragen (" + job.Name + "): Gesehen-Status.");
+                    progress = true;
                 }
 
-                foreach (var target in targets)
+                if (!RestoreLinks(job.RenameLinks, item, pending, job.RenamedAt, out var relinked, out var links, out var moved))
                 {
-                    SaveUserStates(job.RenameUserStates, target);
+                    _store.Update(job, j => j.RenameLinks = links);
+                    progress |= moved;
+                }
+                else
+                {
+                    ClearRenameTransfer(job);
+                    progress = true;
                 }
 
-                _store.Update(job, j => j.RenameUserStates = new List<UserState>());
-                _log.Add("Gesehen-Status von " + job.Name + " auf den umbenannten Film übertragen.");
+                if (relinked > 0)
+                {
+                    _log.Add("Nach dem Umbenennen übertragen (" + job.Name + "): " + relinked + " Playlist-/Sammlungseintrag/-einträge.");
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Codec Converter: Gesehen-Status von {Name} konnte nach dem Umbenennen nicht übertragen werden", job.Name);
-                _store.Update(job, j => j.RenameUserStates = new List<UserState>());
+                ClearRenameTransfer(job);
             }
         }
+
+        return progress;
     }
+
+    // Setzt die Verweise auf den neuen Eintrag. True, wenn keiner mehr wartet.
+    private bool RestoreLinks(List<LinkEntry> stored, BaseItem item, ISet<Guid> pending, DateTime? since, out int relinked, out List<LinkEntry> links, out bool moved)
+    {
+        links = stored.Select(l => l.Clone()).ToList();
+        if (links.Count == 0)
+        {
+            relinked = 0;
+            moved = false;
+            return true;
+        }
+
+        // Nach zwei Stunden nicht mehr auf umbenannte Nachbarn warten.
+        var force = (since ?? DateTime.MinValue) < DateTime.UtcNow.AddHours(-2);
+        var open = links.Count(l => !l.Done);
+        var (restored, waiting) = _links.RestoreAllAsync(links, item, pending, force).GetAwaiter().GetResult();
+        relinked = restored;
+        moved = links.Count(l => !l.Done) < open;
+        return !waiting;
+    }
+
+    // Alte Eintraege, deren Playlist-/Sammlungsverweise noch auf ihre Uebertragung warten.
+    private HashSet<Guid> PendingLinkIds()
+        => LinkKeeper.PendingIds(_store.Snapshot().SelectMany(j => j.RenameLinks.Concat(j.PendingLinks)));
+
+    private void ClearRenameTransfer(Job job)
+        => _store.Update(job, j =>
+        {
+            j.RenameUserStates = new List<UserState>();
+            j.RenameLinks = new List<LinkEntry>();
+        });
 
     private void SaveUserStates(IEnumerable<UserState> states, BaseItem item)
     {

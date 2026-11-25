@@ -17,6 +17,7 @@ public class PluginServiceRegistrator : IPluginServiceRegistrator
         serviceCollection.AddSingleton<JobStore>();
         serviceCollection.AddSingleton<LiveLog>();
         serviceCollection.AddSingleton<SourceInfoCache>();
+        serviceCollection.AddSingleton<LinkKeeper>();
         serviceCollection.AddSingleton<JobRunner>();
         serviceCollection.AddHostedService(provider => provider.GetRequiredService<JobRunner>());
     }

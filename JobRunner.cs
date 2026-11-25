@@ -62,12 +62,9 @@ public sealed partial class JobRunner : IHostedService, IDisposable
     private readonly IMediaEncoder _mediaEncoder;
     private readonly ILogger<JobRunner> _logger;
     private readonly LiveLog _log;
-    private readonly Stopwatch _activeWatch = new();
-    private readonly Dictionary<string, string> _progressBlock = new(StringComparer.Ordinal);
-    private DateTime _lastProgressLog = DateTime.MinValue;
     private bool? _lastBlocked;
     private readonly SourceInfoCache _sourceInfo;
-    private double? _currentExpectedSpeed;
+    private readonly LinkKeeper _links;
     private DateTime _lastDeletedCheck = DateTime.MinValue;
     private readonly CancellationTokenSource _stopping = new();
     private readonly object _lock = new();
@@ -75,11 +72,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
     private readonly SemaphoreSlim _approvalLock = new(1, 1);
     private DateTime _lastAutoApprove = DateTime.MinValue;
     private DateTime _lastUserStateRun = DateTime.MinValue;
-    private DateTime _lastOutput = DateTime.UtcNow;
     private Task? _loop;
-    private Process? _process;
-    private string? _currentJobId;
-    private string? _cancelJobId;
     private readonly DateTime _startTime = DateTime.UtcNow;
     private DateTime _lastCleanup = DateTime.MinValue;
 
@@ -96,6 +89,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
     /// <param name="mediaEncoder">Jellyfins ffmpeg-Zugang.</param>
     /// <param name="logger">Der Logger.</param>
     /// <param name="log">Das Live-Protokoll.</param>
+    /// <param name="links">Playlists und Sammlungen.</param>
     public JobRunner(
         JobStore store,
         LibraryIndex index,
@@ -107,9 +101,11 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         IMediaEncoder mediaEncoder,
         ILogger<JobRunner> logger,
         LiveLog log,
-        SourceInfoCache sourceInfo)
+        SourceInfoCache sourceInfo,
+        LinkKeeper links)
     {
         _log = log;
+        _links = links;
         _sourceInfo = sourceInfo;
         _store = store;
         _index = index;
@@ -507,7 +503,11 @@ public sealed partial class JobRunner : IHostedService, IDisposable
             {
                 case JobState.Queued:
                     // Laeuft der Job in diesem Moment an, erledigt die Abbruch-Markierung den Rest.
-                    _cancelJobId = string.Equals(_currentJobId, id, StringComparison.Ordinal) ? id : _cancelJobId;
+                    if (_workers.TryGetValue(id, out var starting))
+                    {
+                        starting.CancelRequested = true;
+                    }
+
                     _store.Update(job, j =>
                     {
                         j.State = JobState.Cancelled;
@@ -517,7 +517,21 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                     return null;
                 case JobState.Running:
                 case JobState.Paused:
-                    _cancelJobId = id;
+                    if (_workers.TryGetValue(id, out var worker))
+                    {
+                        worker.CancelRequested = true;
+                    }
+                    else
+                    {
+                        // Kein ffmpeg dazu (etwa nach einem Absturz): direkt als abgebrochen markieren.
+                        _store.Update(job, j =>
+                        {
+                            j.State = JobState.Cancelled;
+                            j.Finished = DateTime.UtcNow;
+                            j.Message = "Abgebrochen";
+                        });
+                    }
+
                     return null;
                 case JobState.Finalizing:
                     return "Der Job wird gerade abgeschlossen und kann nicht mehr abgebrochen werden.";
@@ -530,7 +544,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
 
                     return "Dieser Job wartet auf Freigabe: bitte freigeben oder verwerfen.";
                 default:
-                    if (job.PendingUserStates.Count > 0)
+                    if (job.PendingUserStates.Count > 0 || job.PendingLinks.Count > 0)
                     {
                         return "Der Gesehen-Status wird noch auf die neue Datei übertragen. Bitte in ein bis zwei Minuten erneut entfernen.";
                     }
@@ -622,7 +636,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
             lock (_lock)
             {
                 var job = _store.Find(snapshot.Id);
-                if (job is null || job.State != snapshot.State || string.Equals(_currentJobId, job.Id, StringComparison.Ordinal))
+                if (job is null || job.State != snapshot.State || _workers.ContainsKey(job.Id))
                 {
                     continue;
                 }
@@ -661,7 +675,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
     public async Task StopAsync(CancellationToken cancellationToken)
     {
         await _stopping.CancelAsync().ConfigureAwait(false);
-        KillProcess();
+        KillAll();
         if (_loop is not null)
         {
             await Task.WhenAny(_loop, Task.Delay(TimeSpan.FromSeconds(10), cancellationToken)).ConfigureAwait(false);
@@ -671,9 +685,10 @@ public sealed partial class JobRunner : IHostedService, IDisposable
     /// <inheritdoc />
     public void Dispose()
     {
-        KillProcess();
+        KillAll();
         _stopping.Dispose();
         _approvalLock.Dispose();
+        _finalizeLock.Dispose();
     }
 
     private static string DisplayName(MediaEntry entry)
@@ -720,8 +735,9 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 await FixNamingAsync(token).ConfigureAwait(false);
                 await AutoApproveAsync(token).ConfigureAwait(false);
                 RestoreUserStates();
+                SampleWorkers();
 
-                var job = _store.NextQueued();
+                var job = _store.NextQueued(j => !_workers.ContainsKey(j.Id));
                 var blockedNow = IsBlocked;
                 if (job is not null && _lastBlocked != blockedNow)
                 {
@@ -739,13 +755,14 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                         Fail(job, "Jellyfin hat kein ffmpeg gefunden. Bitte den ffmpeg-Pfad in den Wiedergabe-Einstellungen prüfen.");
                     }
                 }
-                else if (job is not null && !IsBlocked)
+                else if (job is not null && !blockedNow && TryStartWorker(job, token))
                 {
-                    await RunJobAsync(job, token).ConfigureAwait(false);
+                    await Task.Delay(TimeSpan.FromSeconds(1), token).ConfigureAwait(false);
                     continue;
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(5), token).ConfigureAwait(false);
+                // Waehrend Jobs laufen, oefter messen.
+                await Task.Delay(TimeSpan.FromSeconds(_workers.IsEmpty ? 5 : 2), token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -764,6 +781,9 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 }
             }
         }
+
+        // Beim Herunterfahren: die Jobs stellen sich selbst zurueck in die Warteschlange.
+        await WaitForWorkersAsync(TimeSpan.FromSeconds(8)).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -851,11 +871,15 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         {
             // Original und neue Datei liegen bis zur Freigabe nebeneinander. Die Schaetzung kann deutlich zu
             // klein sein, deshalb mit Aufschlag rechnen und die Reserve dazunehmen, die auch waehrend des Laufs gilt.
+            // Laufen andere Jobs auf demselben Datentraeger, zaehlt auch deren noch zu schreibender Teil.
             var needed = (long)(Math.Max(job.EstimatedSize, 0) * 1.5) + MinFreeBytes;
-            if (new DriveInfo(source.DirectoryName!).AvailableFreeSpace < needed)
+            var drive = new DriveInfo(source.DirectoryName!);
+            var reserved = ReservedSpace(job, drive);
+            if (drive.AvailableFreeSpace - reserved < needed)
             {
                 return "Zu wenig freier Speicher im Medienordner: nötig sind die geschätzte neue Datei mit Aufschlag und "
-                    + (MinFreeBytes / (1024 * 1024)).ToString(CultureInfo.InvariantCulture) + " MB Reserve.";
+                    + (MinFreeBytes / (1024 * 1024)).ToString(CultureInfo.InvariantCulture) + " MB Reserve"
+                    + (reserved > 0 ? ", dazu der Platz für die gleichzeitig laufenden Jobs" : string.Empty) + ".";
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
@@ -866,18 +890,16 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         return null;
     }
 
-    private async Task RunJobAsync(Job job, CancellationToken token)
+    private async Task RunJobAsync(Worker worker, CancellationToken token)
     {
+        var job = worker.Job;
         lock (_lock)
         {
-            if (job.State != JobState.Queued)
+            if (job.State != JobState.Queued || worker.CancelRequested)
             {
                 // Zwischen Auswahl und Start abgebrochen.
                 return;
             }
-
-            _currentJobId = job.Id;
-            _cancelJobId = null;
         }
 
         try
@@ -923,18 +945,18 @@ public sealed partial class JobRunner : IHostedService, IDisposable
             _log.Add("Quelle: " + Path.GetFileName(job.SourcePath) + "  →  Ziel: " + Path.GetFileName(job.TargetPath));
             _log.Add("ffmpeg " + string.Join(' ', arguments.Select(a => a.Contains(' ', StringComparison.Ordinal) ? "\"" + a + "\"" : a)));
 
-            var (exitCode, errorText, cancelled) = await RunFfmpegAsync(job, arguments, token).ConfigureAwait(false);
+            var (exitCode, errorText, cancelled) = await RunFfmpegAsync(worker, arguments, token).ConfigureAwait(false);
 
             if (gpuDecode && exitCode != 0 && !cancelled && !token.IsCancellationRequested)
             {
                 // Nicht jede Grafikkarte kann jede Quelle dekodieren (alte Codecs, 10 Bit ...): zweiter Versuch,
                 // bei dem die CPU dekodiert und nur das Kodieren auf der GPU laeuft.
                 _logger.LogInformation("Codec Converter: {Name}: Dekodieren auf der GPU fehlgeschlagen ({Error}), zweiter Versuch mit CPU-Dekodierung", job.Name, errorText);
-                _log.Add("Dekodieren auf der Grafikkarte fehlgeschlagen, zweiter Versuch mit CPU-Dekodierung.");
+                _log.Add(Tag(job) + "Dekodieren auf der Grafikkarte fehlgeschlagen, zweiter Versuch mit CPU-Dekodierung.");
                 DeleteIfExists(job.TempPath);
                 _store.Update(job, j => j.Progress = 0);
                 arguments = EncoderCatalog.BuildArguments(job, format, Math.Clamp(Config.Threads, 0, 256), Config.VaapiDevice ?? string.Empty, false);
-                (exitCode, errorText, cancelled) = await RunFfmpegAsync(job, arguments, token).ConfigureAwait(false);
+                (exitCode, errorText, cancelled) = await RunFfmpegAsync(worker, arguments, token).ConfigureAwait(false);
             }
 
             if (token.IsCancellationRequested)
@@ -966,7 +988,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
             {
                 // Erfahrungswert fuer die Zeitschaetzung der naechsten Jobs.
                 _store.Update(job, j => j.AverageSpeed = j.DurationSeconds / j.ActiveSeconds);
-                _log.Add("ffmpeg fertig nach " + Clock(job.ActiveSeconds) + " Rechenzeit (" + job.AverageSpeed.ToString("0.00", CultureInfo.InvariantCulture) + "× Echtzeit). Prüfe die neue Datei …");
+                _log.Add(Tag(job) + "ffmpeg fertig nach " + Clock(job.ActiveSeconds) + " Rechenzeit (" + job.AverageSpeed.ToString("0.00", CultureInfo.InvariantCulture) + "× Echtzeit). Prüfe die neue Datei …");
             }
 
             if (exitCode != 0)
@@ -997,17 +1019,13 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         }
         finally
         {
-            lock (_lock)
-            {
-                _currentJobId = null;
-                _cancelJobId = null;
-                _process = null;
-            }
+            worker.Process = null;
         }
     }
 
-    private async Task<(int ExitCode, string ErrorText, bool Cancelled)> RunFfmpegAsync(Job job, List<string> arguments, CancellationToken token)
+    private async Task<(int ExitCode, string ErrorText, bool Cancelled)> RunFfmpegAsync(Worker worker, List<string> arguments, CancellationToken token)
     {
+        var job = worker.Job;
         var startInfo = new ProcessStartInfo
         {
             FileName = _mediaEncoder.EncoderPath,
@@ -1055,11 +1073,11 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 // Eine beschaedigte Datei erzeugt Tausende gleichartiger Meldungen: nur die ersten ins Live-Protokoll.
                 if (errorLines <= 15)
                 {
-                    _log.Add("ffmpeg: " + e.Data);
+                    _log.Add(Tag(job) + "ffmpeg: " + e.Data);
                 }
                 else if (errorLines == 16)
                 {
-                    _log.Add("ffmpeg: … weitere Meldungen werden nicht mehr einzeln angezeigt.");
+                    _log.Add(Tag(job) + "ffmpeg: … weitere Meldungen werden nicht mehr einzeln angezeigt.");
                 }
 
                 // Die Ursache steht meist am Anfang, das Ergebnis am Ende: beides aufheben.
@@ -1075,13 +1093,10 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 }
             }
         };
-        process.OutputDataReceived += (_, e) => ReadProgress(job, e.Data);
+        process.OutputDataReceived += (_, e) => ReadProgress(worker, e.Data);
 
         process.Start();
-        lock (_lock)
-        {
-            _process = process;
-        }
+        worker.Process = process;
 
         process.BeginErrorReadLine();
         process.BeginOutputReadLine();
@@ -1098,54 +1113,48 @@ public sealed partial class JobRunner : IHostedService, IDisposable
 
         var paused = false;
         var cancelled = false;
-        _lastOutput = DateTime.UtcNow;
-        _lastProgressLog = DateTime.MinValue;
-        _progressBlock.Clear();
-        _currentExpectedSpeed = ExpectedSpeed(BuildSpeedTable(_store.Snapshot()), job.Encoder, job.Speed, job.Width, job.Height, job.Fps);
-        _activeWatch.Restart();
+        worker.LastOutput = DateTime.UtcNow;
+        worker.LastProgressLog = DateTime.MinValue;
+        worker.ProgressBlock.Clear();
+        worker.ExpectedSpeed = ExpectedSpeed(BuildSpeedTable(_store.Snapshot()), job.Encoder, job.Speed, job.Width, job.Height, job.Fps);
+        worker.ActiveWatch.Restart();
         _store.Update(job, j => j.ActiveSeconds = 0, persist: false);
         while (!process.HasExited)
         {
-            // Auch waehrend einer langen Umwandlung aufraeumen, nicht erst danach.
-            RemoveJobsOfDeletedFiles();
-
             if (!paused && FreeSpaceLow(job))
             {
                 // Die neue Datei wird groesser als geschaetzt und der Datentraeger laeuft voll: abbrechen, bevor er voll ist.
-                _log.Add("Freier Speicher im Medienordner unter " + (MinFreeBytes / (1024 * 1024)).ToString(CultureInfo.InvariantCulture) + " MB, breche ab.");
-                KillProcess();
+                _log.Add(Tag(job) + "Freier Speicher im Medienordner unter " + (MinFreeBytes / (1024 * 1024)).ToString(CultureInfo.InvariantCulture) + " MB, breche ab.");
+                KillProcess(worker);
                 diskFull = true;
                 break;
             }
 
-            if (!paused && DateTime.UtcNow - _lastOutput > StallTimeout)
+            if (!paused && DateTime.UtcNow - worker.LastOutput > StallTimeout)
             {
-                // Ein haengendes ffmpeg wuerde sonst die ganze Warteschlange blockieren.
-                _logger.LogWarning("Codec Converter: ffmpeg meldet seit {Minutes} Minuten nichts mehr und wird beendet", StallTimeout.TotalMinutes);
-                _log.Add("ffmpeg meldet seit " + StallTimeout.TotalMinutes.ToString(CultureInfo.InvariantCulture) + " Minuten nichts mehr und wird beendet.");
-                KillProcess();
+                // Ein haengendes ffmpeg wuerde sonst die Warteschlange blockieren.
+                _logger.LogWarning("Codec Converter: ffmpeg von {Name} meldet seit {Minutes} Minuten nichts mehr und wird beendet", job.Name, StallTimeout.TotalMinutes);
+                _log.Add(Tag(job) + "ffmpeg meldet seit " + StallTimeout.TotalMinutes.ToString(CultureInfo.InvariantCulture) + " Minuten nichts mehr und wird beendet.");
+                KillProcess(worker);
                 stalled = true;
                 break;
             }
 
-            bool cancelRequested;
-            lock (_lock)
-            {
-                cancelRequested = string.Equals(_cancelJobId, job.Id, StringComparison.Ordinal);
-            }
-
+            var cancelRequested = worker.CancelRequested;
             if (token.IsCancellationRequested || cancelRequested)
             {
                 cancelled = cancelRequested;
-                KillProcess();
+                KillProcess(worker);
                 break;
             }
 
+            // Bei erreichter Stream-Grenze halten alle laufenden Jobs an.
             var blocked = IsBlocked;
             if (blocked && !paused && Signal(process, stop: true))
             {
                 paused = true;
-                _activeWatch.Stop();
+                worker.Paused = true;
+                worker.ActiveWatch.Stop();
                 _log.Add("PAUSE " + job.Name + ": " + ActiveStreams + " Streams aktiv (Grenze " + StreamLimit + ").");
                 _store.Update(job, j => j.State = JobState.Paused);
                 _logger.LogInformation("Codec Converter: {Name} angehalten, {Streams} Streams aktiv", job.Name, ActiveStreams);
@@ -1153,9 +1162,10 @@ public sealed partial class JobRunner : IHostedService, IDisposable
             else if (!blocked && paused && Signal(process, stop: false))
             {
                 paused = false;
-                _activeWatch.Start();
+                worker.Paused = false;
+                worker.ActiveWatch.Start();
                 _log.Add("WEITER " + job.Name + ": Streams wieder unter der Grenze.");
-                _lastOutput = DateTime.UtcNow;
+                worker.LastOutput = DateTime.UtcNow;
                 _store.Update(job, j => j.State = JobState.Running);
                 _logger.LogInformation("Codec Converter: {Name} läuft weiter", job.Name);
             }
@@ -1173,8 +1183,10 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         }
 
         await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-        _activeWatch.Stop();
-        _store.Update(job, j => j.ActiveSeconds = _activeWatch.Elapsed.TotalSeconds, persist: false);
+        worker.ActiveWatch.Stop();
+        worker.Paused = false;
+        worker.ProcessEnded(process);
+        _store.Update(job, j => j.ActiveSeconds = worker.ActiveWatch.Elapsed.TotalSeconds, persist: false);
 
         string errorText;
         int sourceErrors;
@@ -1208,9 +1220,10 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         return (process.ExitCode, errorText, cancelled);
     }
 
-    private void ReadProgress(Job job, string? line)
+    private void ReadProgress(Worker worker, string? line)
     {
-        _lastOutput = DateTime.UtcNow;
+        var job = worker.Job;
+        worker.LastOutput = DateTime.UtcNow;
         if (line is null || job.DurationSeconds <= 0)
         {
             return;
@@ -1224,14 +1237,14 @@ public sealed partial class JobRunner : IHostedService, IDisposable
 
         var key = line[..separator];
         var value = line[(separator + 1)..].Trim();
-        _progressBlock[key] = value;
+        worker.ProgressBlock[key] = value;
 
         if (key == "out_time_us"
             && long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var microseconds)
             && microseconds > 0)
         {
             var progress = Math.Clamp(microseconds / 1_000_000d / job.DurationSeconds, 0, 0.999);
-            var active = _activeWatch.Elapsed.TotalSeconds;
+            var active = worker.ActiveWatch.Elapsed.TotalSeconds;
             _store.Update(
                 job,
                 j =>
@@ -1246,27 +1259,27 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         {
             _store.Update(job, j => j.EncodeSpeed = speed, persist: false);
         }
-        else if (key == "progress" && DateTime.UtcNow - _lastProgressLog > TimeSpan.FromSeconds(5))
+        else if (key == "progress" && DateTime.UtcNow - worker.LastProgressLog > TimeSpan.FromSeconds(5))
         {
             // "progress" schliesst einen Block von ffmpeg ab: alle paar Sekunden eine Zeile fuers Live-Protokoll.
-            _lastProgressLog = DateTime.UtcNow;
-            _progressBlock.TryGetValue("frame", out var frame);
-            _progressBlock.TryGetValue("fps", out var fps);
-            _progressBlock.TryGetValue("total_size", out var size);
+            worker.LastProgressLog = DateTime.UtcNow;
+            worker.ProgressBlock.TryGetValue("frame", out var frame);
+            worker.ProgressBlock.TryGetValue("fps", out var fps);
+            worker.ProgressBlock.TryGetValue("total_size", out var size);
             var megabytes = long.TryParse(size, NumberStyles.Integer, CultureInfo.InvariantCulture, out var bytes) ? (bytes / 1048576d).ToString("0.0", CultureInfo.InvariantCulture) + " MB" : "?";
             // Dieselbe Rechnung wie in der Warteschlange: am Anfang der Erfahrungswert frueherer Jobs, danach der eigene Verlauf.
             double? remaining = null;
             var ownHistory = job.ActiveSeconds >= 10 && job.Progress >= 0.005;
-            if (_currentExpectedSpeed is not null && (job.Progress < 0.05 || !ownHistory))
+            if (worker.ExpectedSpeed is not null && (job.Progress < 0.05 || !ownHistory))
             {
-                remaining = job.DurationSeconds * (1 - job.Progress) / _currentExpectedSpeed.Value;
+                remaining = job.DurationSeconds * (1 - job.Progress) / worker.ExpectedSpeed.Value;
             }
             else if (ownHistory)
             {
                 remaining = job.DurationSeconds * (1 - job.Progress) / (job.Progress * job.DurationSeconds / job.ActiveSeconds);
             }
 
-            _log.Add(string.Format(
+            _log.Add(Tag(job) + string.Format(
                 CultureInfo.InvariantCulture,
                 "{0:0} %  Bild {1}  {2} Bilder/s  Stelle {3} von {4}  bisher {5}  Rest ca. {6}",
                 job.Progress * 100,
@@ -1321,14 +1334,9 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         }
     }
 
-    private void KillProcess()
+    private void KillProcess(Worker worker)
     {
-        Process? process;
-        lock (_lock)
-        {
-            process = _process;
-        }
-
+        var process = worker.Process;
         try
         {
             if (process is not null && !process.HasExited)
@@ -1339,6 +1347,14 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
         {
             _logger.LogDebug(ex, "Codec Converter: ffmpeg war bereits beendet");
+        }
+    }
+
+    private void KillAll()
+    {
+        foreach (var worker in _workers.Values)
+        {
+            KillProcess(worker);
         }
     }
 
@@ -1423,51 +1439,62 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         });
 
         var problem = await VerifyAsync(job, job.TempPath, token).ConfigureAwait(false);
+
+        // Mehrere Jobs koennen gleichzeitig fertig werden: Namen waehlen und Datei ablegen immer nacheinander,
+        // damit zwei Jobs im selben Ordner nicht denselben Namen bekommen.
         NamingPlan? plan = null;
-        if (problem is null)
+        await _finalizeLock.WaitAsync(CancellationToken.None).ConfigureAwait(false);
+        try
         {
+            if (problem is null)
+            {
+                try
+                {
+                    // Die Namen noch einmal pruefen: im Ordner kann sich seit dem Planen etwas geaendert haben.
+                    var movie = IsMovie(job);
+                    plan = PlanNames(job.SourcePath, job.SourceCodec, job.TargetCodec, movie, movie ? null : EpisodeInfo(job.ItemId, job.SourcePath), null, ReservedTargets(job.Id));
+                    if (File.Exists(plan.TargetPath))
+                    {
+                        problem = "Die Zieldatei " + Path.GetFileName(plan.TargetPath) + " existiert inzwischen.";
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    problem = "Der Ordner ließ sich nicht lesen: " + ex.Message;
+                }
+            }
+
+            if (problem is not null || plan is null)
+            {
+                DeleteIfExists(job.TempPath);
+                Fail(job, problem + " Das Original wurde nicht angetastet.");
+                return;
+            }
+
             try
             {
-                // Die Namen noch einmal pruefen: im Ordner kann sich seit dem Planen etwas geaendert haben.
-                var movie = IsMovie(job);
-                plan = PlanNames(job.SourcePath, job.SourceCodec, job.TargetCodec, movie, movie ? null : EpisodeInfo(job.ItemId, job.SourcePath), null, ReservedTargets(job.Id));
-                if (File.Exists(plan.TargetPath))
+                if (!OperatingSystem.IsWindows())
                 {
-                    problem = "Die Zieldatei " + Path.GetFileName(plan.TargetPath) + " existiert inzwischen.";
+                    // Die neue Datei bekommt dieselben Zugriffsrechte wie das Original.
+                    File.SetUnixFileMode(job.TempPath, File.GetUnixFileMode(job.SourcePath));
                 }
+
+                // Erst den Namen speichern, dann verschieben: nach einem Absturz findet die Wiederaufnahme die Datei.
+                _store.Update(job, j => j.TargetPath = plan.TargetPath);
+
+                // Das Original bleibt, wo es ist. Die neue Datei erscheint unter ihrem endgueltigen Namen daneben.
+                File.Move(job.TempPath, job.TargetPath, false);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                problem = "Der Ordner ließ sich nicht lesen: " + ex.Message;
+                DeleteIfExists(job.TempPath);
+                Fail(job, "Abschluss fehlgeschlagen: " + ex.Message + " Das Original wurde nicht angetastet.");
+                return;
             }
         }
-
-        if (problem is not null || plan is null)
+        finally
         {
-            DeleteIfExists(job.TempPath);
-            Fail(job, problem + " Das Original wurde nicht angetastet.");
-            return;
-        }
-
-        try
-        {
-            if (!OperatingSystem.IsWindows())
-            {
-                // Die neue Datei bekommt dieselben Zugriffsrechte wie das Original.
-                File.SetUnixFileMode(job.TempPath, File.GetUnixFileMode(job.SourcePath));
-            }
-
-            // Erst den Namen speichern, dann verschieben: nach einem Absturz findet die Wiederaufnahme die Datei.
-            _store.Update(job, j => j.TargetPath = plan.TargetPath);
-
-            // Das Original bleibt, wo es ist. Die neue Datei erscheint unter ihrem endgueltigen Namen daneben.
-            File.Move(job.TempPath, job.TargetPath, false);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            DeleteIfExists(job.TempPath);
-            Fail(job, "Abschluss fehlgeschlagen: " + ex.Message + " Das Original wurde nicht angetastet.");
-            return;
+            _finalizeLock.Release();
         }
 
         var sidecars = CopySidecars(job);
@@ -1620,6 +1647,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
             }
 
             var userStates = CaptureUserStates(job.Name, job.SourcePath, job.TargetPath);
+            var links = _links.Capture(new[] { job.SourcePath, job.TargetPath });
 
             try
             {
@@ -1652,6 +1680,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 j.State = JobState.Done;
                 j.Finished = DateTime.UtcNow;
                 j.PendingUserStates = userStates;
+                j.PendingLinks = links;
                 j.Message = (automatic ? "Automatisch freigegeben" : "Freigegeben") + ", Original gelöscht. Neue Datei: " + Path.GetFileName(j.TargetPath);
             });
             _logger.LogInformation("Codec Converter: {Name} {Mode} freigegeben, Original {Path} gelöscht", job.Name, automatic ? "automatisch" : "von Hand", job.SourcePath);
@@ -1679,7 +1708,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         {
             foreach (var path in paths.Distinct(StringComparer.Ordinal))
             {
-                var item = _libraryManager.FindByPath(path, false);
+                var item = LinkKeeper.FindItem(_libraryManager, path);
                 if (item is null)
                 {
                     continue;
@@ -1730,11 +1759,28 @@ public sealed partial class JobRunner : IHostedService, IDisposable
         }
 
         _lastUserStateRun = DateTime.UtcNow;
-        RestoreRenameStates();
+
+        // Mehrere Durchgaenge, damit umbenannte Nachbarn in Playlists in der richtigen Reihenfolge zurueckkommen.
+        for (var round = 0; round < 20; round++)
+        {
+            var pending = PendingLinkIds();
+            var progress = RestoreRenameStates(pending);
+            progress |= RestoreDecisionStates(pending);
+            if (!progress)
+            {
+                break;
+            }
+        }
+    }
+
+    // Nach Freigabe oder Verwerfen: Stand und Verweise auf die verbliebene Datei.
+    private bool RestoreDecisionStates(ISet<Guid> pending)
+    {
+        var progress = false;
         foreach (var id in _store.IdsInState(JobState.Done).Concat(_store.IdsInState(JobState.Rejected)))
         {
             var job = _store.Find(id);
-            if (job is null || job.PendingUserStates.Count == 0)
+            if (job is null || (job.PendingUserStates.Count == 0 && job.PendingLinks.Count == 0))
             {
                 continue;
             }
@@ -1747,28 +1793,58 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 if (job.Finished < DateTime.UtcNow.AddDays(-1))
                 {
                     // Die Datei ist nie in der Bibliothek aufgetaucht: aufgeben.
-                    _store.Update(job, j => j.PendingUserStates = new List<UserState>());
+                    ClearPendingTransfer(job);
+                    progress = true;
                     continue;
                 }
 
-                var item = _libraryManager.FindByPath(keep, false);
-                if (item is null || _libraryManager.FindByPath(gone, false) is not null)
+                var item = LinkKeeper.FindItem(_libraryManager, keep);
+                if (item is null || LinkKeeper.FindItem(_libraryManager, gone) is not null)
                 {
                     continue;
                 }
 
-                SaveUserStates(job.PendingUserStates, item);
-                _store.Update(job, j => j.PendingUserStates = new List<UserState>());
-                _logger.LogInformation("Codec Converter: Gesehen-Status von {Name} auf {File} übertragen", job.Name, Path.GetFileName(keep));
-                _log.Add("Gesehen-Status von " + job.Name + " auf " + Path.GetFileName(keep) + " übertragen.");
+                if (job.PendingUserStates.Count > 0)
+                {
+                    SaveUserStates(job.PendingUserStates, item);
+                    _store.Update(job, j => j.PendingUserStates = new List<UserState>());
+                    _logger.LogInformation("Codec Converter: Gesehen-Status von {Name} auf {File} übertragen", job.Name, Path.GetFileName(keep));
+                    _log.Add("Übertragen auf " + Path.GetFileName(keep) + ": Gesehen-Status.");
+                    progress = true;
+                }
+
+                if (!RestoreLinks(job.PendingLinks, item, pending, job.Finished, out var relinked, out var links, out var moved))
+                {
+                    _store.Update(job, j => j.PendingLinks = links);
+                    progress |= moved;
+                }
+                else
+                {
+                    ClearPendingTransfer(job);
+                    progress = true;
+                }
+
+                if (relinked > 0)
+                {
+                    _log.Add("Übertragen auf " + Path.GetFileName(keep) + ": " + relinked + " Playlist-/Sammlungseintrag/-einträge.");
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Codec Converter: Gesehen-Status von {Name} konnte nicht übertragen werden", job.Name);
-                _store.Update(job, j => j.PendingUserStates = new List<UserState>());
+                ClearPendingTransfer(job);
             }
         }
+
+        return progress;
     }
+
+    private void ClearPendingTransfer(Job job)
+        => _store.Update(job, j =>
+        {
+            j.PendingUserStates = new List<UserState>();
+            j.PendingLinks = new List<LinkEntry>();
+        });
 
     /// <summary>
     /// Verwirft eine umgewandelte Datei: die neue Datei wird geloescht, das Original bleibt.
@@ -1809,6 +1885,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
 
             // War die neue Datei die Hauptversion, haengt der Gesehen-Status an ihr. Merken fuer das Original.
             var userStates = CaptureUserStates(job.Name, job.SourcePath, job.TargetPath);
+            var links = _links.Capture(new[] { job.SourcePath, job.TargetPath });
 
             try
             {
@@ -1833,6 +1910,7 @@ public sealed partial class JobRunner : IHostedService, IDisposable
                 j.State = JobState.Rejected;
                 j.Finished = DateTime.UtcNow;
                 j.PendingUserStates = userStates;
+                j.PendingLinks = links;
                 j.Message = "Verworfen, das Original bleibt" + (j.OriginalPath is not null ? " (unter dem Namen " + Path.GetFileName(j.SourcePath) + ")." : ".");
             });
             _logger.LogInformation("Codec Converter: {Name} verworfen, {Path} gelöscht", job.Name, job.TargetPath);
